@@ -1,6 +1,7 @@
 "use client";
 
-import { useRef, useCallback, useState } from "react";
+import { useRef, useCallback, useState, useEffect } from "react";
+import { EffectsChain, defaultEffectsState, type EffectsState } from "@/lib/audio-effects";
 
 export interface Beat {
   index: number;
@@ -50,10 +51,14 @@ export interface JumpSettings {
   minSecondsBetweenJumps: number;
 }
 
+export type { EffectsState } from "@/lib/audio-effects";
+
 export function useAudioEngine() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const audioBufferRef = useRef<AudioBuffer | null>(null);
   const sourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const sourceGainRef = useRef<GainNode | null>(null);
+  const effectsChainRef = useRef<EffectsChain | null>(null);
   const startTimeRef = useRef<number>(0);
   const startOffsetRef = useRef<number>(0);
   const lastLoopContextTimeRef = useRef<number | null>(null);
@@ -65,6 +70,8 @@ export function useAudioEngine() {
     jumpProbability: 0.25,
     minSecondsBetweenJumps: 2,
   });
+  const effectsStateRef = useRef<EffectsState>(defaultEffectsState);
+  const volumeRef = useRef<number>(1);
 
   const playbackStateRef = useRef<PlaybackState>({
     isPlaying: false,
@@ -89,33 +96,100 @@ export function useAudioEngine() {
     setPlaybackState({ ...playbackStateRef.current });
   }, []);
 
+  const ensureContext = useCallback((): AudioContext => {
+    if (!audioCtxRef.current) {
+      const Ctx =
+        typeof window !== "undefined"
+          ? (window.AudioContext ||
+              (window as unknown as { webkitAudioContext?: typeof AudioContext })
+                .webkitAudioContext)
+          : undefined;
+      if (!Ctx) throw new Error("Web Audio API not supported in this browser.");
+      audioCtxRef.current = new Ctx();
+    }
+    if (!effectsChainRef.current && audioCtxRef.current) {
+      const chain = new EffectsChain(audioCtxRef.current);
+      chain.apply(effectsStateRef.current);
+      chain.setMasterGain(volumeRef.current);
+      chain.output.connect(audioCtxRef.current.destination);
+      effectsChainRef.current = chain;
+      // Fire-and-forget: warm up the worklet so first toggle is instant.
+      chain.preload();
+    }
+    return audioCtxRef.current!;
+  }, []);
+
   const getCurrentAudioTime = useCallback((): number => {
     if (!audioCtxRef.current || !playbackStateRef.current.isPlaying) return startOffsetRef.current;
     return startOffsetRef.current + (audioCtxRef.current.currentTime - startTimeRef.current);
   }, []);
 
-  const stopCurrentSource = useCallback(() => {
-    if (sourceRef.current) {
-      try {
-        sourceRef.current.stop();
-        sourceRef.current.disconnect();
-      } catch (_) {}
-      sourceRef.current = null;
-    }
+  // Fade out and dispose the current source. Pass withFade=false when the
+  // caller is about to start a new source right away (playFrom already
+  // handles the crossfade in that case).
+  const stopCurrentSource = useCallback((withFade = true) => {
+    const ctx = audioCtxRef.current;
+    const src = sourceRef.current;
+    const gain = sourceGainRef.current;
+    sourceRef.current = null;
+    sourceGainRef.current = null;
+    if (!src) return;
+
+    try {
+      if (withFade && ctx && gain) {
+        const now = ctx.currentTime;
+        const g = gain.gain;
+        g.cancelScheduledValues(now);
+        g.setValueAtTime(g.value, now);
+        g.linearRampToValueAtTime(0, now + 0.012);
+        src.stop(now + 0.015);
+      } else {
+        src.stop();
+        src.disconnect();
+        gain?.disconnect();
+      }
+    } catch (_) {}
   }, []);
 
-  const playFrom = useCallback((offset: number) => {
-    if (!audioCtxRef.current || !audioBufferRef.current) return;
-    stopCurrentSource();
+  const playFrom = useCallback(
+    (offset: number) => {
+      const ctx = audioCtxRef.current;
+      const chain = effectsChainRef.current;
+      if (!ctx || !audioBufferRef.current || !chain) return;
 
-    const source = audioCtxRef.current.createBufferSource();
-    source.buffer = audioBufferRef.current;
-    source.connect(audioCtxRef.current.destination);
-    source.start(0, offset);
-    sourceRef.current = source;
-    startTimeRef.current = audioCtxRef.current.currentTime;
-    startOffsetRef.current = offset;
-  }, [stopCurrentSource]);
+      const now = ctx.currentTime;
+      const fadeTime = 0.01; // 10ms crossfade keeps jumps click-free
+
+      // Fade out the previous source and schedule its stop.
+      const prevSrc = sourceRef.current;
+      const prevGain = sourceGainRef.current;
+      if (prevSrc && prevGain) {
+        try {
+          const g = prevGain.gain;
+          g.cancelScheduledValues(now);
+          g.setValueAtTime(g.value, now);
+          g.linearRampToValueAtTime(0, now + fadeTime);
+          prevSrc.stop(now + fadeTime + 0.005);
+        } catch (_) {}
+      }
+
+      // Create a new source + its own gain so we can fade it in independently.
+      const source = ctx.createBufferSource();
+      source.buffer = audioBufferRef.current;
+      const sourceGain = ctx.createGain();
+      sourceGain.gain.setValueAtTime(0, now);
+      sourceGain.gain.linearRampToValueAtTime(1, now + fadeTime);
+      source.connect(sourceGain);
+      sourceGain.connect(chain.input);
+      source.start(0, offset);
+
+      sourceRef.current = source;
+      sourceGainRef.current = sourceGain;
+      startTimeRef.current = now;
+      startOffsetRef.current = offset;
+    },
+    [],
+  );
 
   const runPlaybackLoop = useCallback(() => {
     const loop = () => {
@@ -199,29 +273,27 @@ export function useAudioEngine() {
     animFrameRef.current = requestAnimationFrame(loop);
   }, [getCurrentAudioTime, playFrom, updateState]);
 
-  const loadAudio = useCallback(async (file: File, analysisData: AnalysisData) => {
-    // Initialize AudioContext on user interaction
-    if (!audioCtxRef.current) {
-      audioCtxRef.current = new AudioContext();
-    }
+  const loadAudio = useCallback(
+    async (file: File, analysisData: AnalysisData) => {
+      const ctx = ensureContext();
+      const arrayBuffer = await file.arrayBuffer();
+      audioBufferRef.current = await ctx.decodeAudioData(arrayBuffer);
 
-    const arrayBuffer = await file.arrayBuffer();
-    audioBufferRef.current = await audioCtxRef.current.decodeAudioData(arrayBuffer);
-
-    beatsRef.current = analysisData.beats;
-    jumpMapRef.current = buildJumpMap(analysisData.beats, analysisData.edges);
-  }, []);
+      beatsRef.current = analysisData.beats;
+      jumpMapRef.current = buildJumpMap(analysisData.beats, analysisData.edges);
+    },
+    [ensureContext],
+  );
 
   const play = useCallback(() => {
-    if (!audioBufferRef.current || !audioCtxRef.current) return;
+    const ctx = audioCtxRef.current;
+    if (!audioBufferRef.current || !ctx) return;
 
-    if (audioCtxRef.current.state === "suspended") {
-      audioCtxRef.current.resume();
-    }
+    if (ctx.state === "suspended") ctx.resume();
 
     const offset = startOffsetRef.current;
     playFrom(offset);
-    lastLoopContextTimeRef.current = audioCtxRef.current.currentTime;
+    lastLoopContextTimeRef.current = ctx.currentTime;
     updateState({ isPlaying: true });
     runPlaybackLoop();
   }, [playFrom, updateState, runPlaybackLoop]);
@@ -282,6 +354,17 @@ export function useAudioEngine() {
     jumpSettingsRef.current = { ...jumpSettingsRef.current, ...partial };
   }, []);
 
+  const setEffectsState = useCallback((state: EffectsState) => {
+    effectsStateRef.current = state;
+    effectsChainRef.current?.apply(state);
+  }, []);
+
+  const setVolume = useCallback((volume: number) => {
+    const v = Math.max(0, Math.min(1.5, volume));
+    volumeRef.current = v;
+    effectsChainRef.current?.setMasterGain(v);
+  }, []);
+
   const reset = useCallback(() => {
     cancelAnimationFrame(animFrameRef.current);
     stopCurrentSource();
@@ -301,6 +384,23 @@ export function useAudioEngine() {
     });
   }, [stopCurrentSource, updateState]);
 
+  // Tear down completely on unmount.
+  useEffect(() => {
+    return () => {
+      cancelAnimationFrame(animFrameRef.current);
+      try {
+        sourceRef.current?.stop();
+        sourceRef.current?.disconnect();
+      } catch (_) {}
+      effectsChainRef.current?.dispose();
+      effectsChainRef.current = null;
+      if (audioCtxRef.current && audioCtxRef.current.state !== "closed") {
+        audioCtxRef.current.close().catch(() => {});
+      }
+      audioCtxRef.current = null;
+    };
+  }, []);
+
   return {
     loadAudio,
     play,
@@ -309,6 +409,8 @@ export function useAudioEngine() {
     seekToTime,
     reset,
     setJumpSettings,
+    setEffectsState,
+    setVolume,
     playbackState,
     getCurrentAudioTime,
   };

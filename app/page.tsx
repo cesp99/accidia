@@ -5,7 +5,8 @@ import { BeatCircle } from "@/components/jukebox/beat-circle";
 import { UploadForm } from "@/components/jukebox/upload-form";
 import { PlayerControls } from "@/components/jukebox/player-controls";
 import { useAudioEngine } from "@/hooks/use-audio-engine";
-import type { AnalysisData, JumpSettings } from "@/hooks/use-audio-engine";
+import type { AnalysisData, JumpSettings, EffectsState } from "@/hooks/use-audio-engine";
+import { defaultEffectsState } from "@/lib/audio-effects";
 import { Infinity, Music2, AlertCircle } from "lucide-react";
 
 type AppState = "idle" | "loading" | "playing";
@@ -56,12 +57,15 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(false);
   const audioLoaded = useRef(false);
 
-  const { loadAudio, play, pause, seek, seekToTime, reset, setJumpSettings, playbackState } = useAudioEngine();
+  const { loadAudio, play, pause, seek, seekToTime, reset, setJumpSettings, setEffectsState, setVolume, playbackState } = useAudioEngine();
 
   const [jumpSettings, setJumpSettingsState] = useState<JumpSettings>({
     jumpProbability: 0.25,
     minSecondsBetweenJumps: 2,
   });
+
+  const [effectsState, setEffectsStateLocal] = useState<EffectsState>(defaultEffectsState);
+  const [volume, setVolumeLocal] = useState<number>(1);
 
   const handleJumpSettingsChange = useCallback(
     (partial: Partial<JumpSettings>) => {
@@ -72,6 +76,22 @@ export default function Home() {
       });
     },
     [setJumpSettings]
+  );
+
+  const handleEffectsChange = useCallback(
+    (next: EffectsState) => {
+      setEffectsStateLocal(next);
+      setEffectsState(next);
+    },
+    [setEffectsState]
+  );
+
+  const handleVolumeChange = useCallback(
+    (next: number) => {
+      setVolumeLocal(next);
+      setVolume(next);
+    },
+    [setVolume]
   );
 
   const handleAnalysisComplete = useCallback(
@@ -249,8 +269,12 @@ export default function Home() {
               duration={analysisData.duration}
               playedSeconds={playbackState.playedSeconds}
               jumpSettings={jumpSettings}
+              effectsState={effectsState}
+              volume={volume}
               onSeekTime={seekToTime}
               onJumpSettingsChange={handleJumpSettingsChange}
+              onEffectsChange={handleEffectsChange}
+              onVolumeChange={handleVolumeChange}
             />
           </div>
         )}

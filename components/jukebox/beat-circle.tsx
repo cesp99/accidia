@@ -12,15 +12,16 @@ interface BeatCircleProps {
   onBeatClick?: (beatIndex: number) => void;
 }
 
-const RADIUS = 220;
-const CENTER = 300;
-const SVG_SIZE = 600;
+// Default square design frame used for sizing conversions
+const DESIGN_SIZE = 600;
+// Base dot radii expressed in CSS pixels at DESIGN_SIZE; will be scaled
+// with sqrt(size/DESIGN_SIZE) so mobile dots don't vanish.
 const BEAT_DOT_R = 4;
 const ACTIVE_DOT_R = 7;
 
 function circleGeometry(size: number) {
   // Larger fill on small screens, more breathing room on desktop.
-  const radiusRatio = size <= 420 ? 0.44 : 0.37;
+  const radiusRatio = size <= 420 ? 0.44 : 0.38;
   return {
     cx: size / 2,
     cy: size / 2,
@@ -30,26 +31,17 @@ function circleGeometry(size: number) {
 
 // Map beat index to angle in radians (0 = top, clockwise)
 function beatAngle(beatIndex: number, totalBeats: number): number {
+  if (totalBeats <= 0) return -Math.PI / 2;
   return (beatIndex / totalBeats) * 2 * Math.PI - Math.PI / 2;
 }
 
-// Map beat index to x,y on the circle
-function beatPos(beatIndex: number, totalBeats: number, radius = RADIUS, center = CENTER) {
+// Map beat index to x,y on the circle (CSS pixels)
+function beatPos(beatIndex: number, totalBeats: number, radius: number, centerX: number, centerY: number) {
   const angle = beatAngle(beatIndex, totalBeats);
   return {
-    x: center + radius * Math.cos(angle),
-    y: center + radius * Math.sin(angle),
+    x: centerX + radius * Math.cos(angle),
+    y: centerY + radius * Math.sin(angle),
   };
-}
-
-// Cubic bezier arc through center for a "chord" style arc
-function arcPath(fromIdx: number, toIdx: number, totalBeats: number): string {
-  const from = beatPos(fromIdx, totalBeats);
-  const to = beatPos(toIdx, totalBeats);
-  // Control point: slightly pulled toward center
-  const cpX = CENTER + (CENTER - (from.x + to.x) / 2) * 0.3;
-  const cpY = CENTER + (CENTER - (from.y + to.y) / 2) * 0.3;
-  return `M ${from.x} ${from.y} Q ${cpX} ${cpY} ${to.x} ${to.y}`;
 }
 
 export function BeatCircle({
@@ -57,15 +49,23 @@ export function BeatCircle({
   edges,
   currentBeat,
   lastJump,
-  duration,
+  duration: _duration,
   onBeatClick,
 }: BeatCircleProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const jumpFlashRef = useRef<{ from: number; to: number; opacity: number } | null>(null);
   const animRef = useRef<number>(0);
-  const prevBeatRef = useRef(currentBeat);
 
-  const n = beats.length;
+  // Keep latest values in refs so the draw loop can read them without
+  // resubscribing to RAF on every state change.
+  const beatsRef = useRef<Beat[]>(beats);
+  const edgesRef = useRef<Edge[]>(edges);
+  const currentBeatRef = useRef<number>(currentBeat);
+  const sizeRef = useRef<number>(DESIGN_SIZE);
+
+  beatsRef.current = beats;
+  edgesRef.current = edges;
+  currentBeatRef.current = currentBeat;
 
   // Detect jumps
   useEffect(() => {
@@ -78,14 +78,26 @@ export function BeatCircle({
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
-    if (!ctx || !n) return;
+    if (!ctx) return;
+
+    const beats = beatsRef.current;
+    const edges = edgesRef.current;
+    const currentBeat = currentBeatRef.current;
+    const n = beats.length;
+    if (!n) return;
 
     const dpr = window.devicePixelRatio || 1;
-    const size = canvas.width / dpr;
-    const scale = size / SVG_SIZE;
-    const { cx, cy, r } = circleGeometry(size);
+    const size = sizeRef.current;
+    // Scale context so we can draw everything in CSS pixel units regardless
+    // of device pixel ratio. This was the source of the "circle in the
+    // top-left quadrant" bug on mobile / retina screens.
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, size, size);
 
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // Dot radius scales gently with the overall size so they stay visible
+    // on phones and never get absurdly large on desktop.
+    const dotScale = Math.max(0.7, Math.min(1.4, Math.sqrt(size / DESIGN_SIZE)));
+    const { cx, cy, r } = circleGeometry(size);
 
     // Background ring
     ctx.beginPath();
@@ -96,8 +108,8 @@ export function BeatCircle({
 
     // Draw all edges (faint)
     for (const edge of edges) {
-      const from = beatPos(edge.from, n, r, cx);
-      const to = beatPos(edge.to, n, r, cx);
+      const from = beatPos(edge.from, n, r, cx, cy);
+      const to = beatPos(edge.to, n, r, cx, cy);
       const cpX = cx + (cx - (from.x + to.x) / 2) * 0.3;
       const cpY = cy + (cy - (from.y + to.y) / 2) * 0.3;
 
@@ -111,12 +123,10 @@ export function BeatCircle({
     }
 
     // Highlight edges from/to current beat
-    const activeEdges = edges.filter(
-      (e) => e.from === currentBeat || e.to === currentBeat
-    );
-    for (const edge of activeEdges) {
-      const from = beatPos(edge.from, n, r, cx);
-      const to = beatPos(edge.to, n, r, cx);
+    for (const edge of edges) {
+      if (edge.from !== currentBeat && edge.to !== currentBeat) continue;
+      const from = beatPos(edge.from, n, r, cx, cy);
+      const to = beatPos(edge.to, n, r, cx, cy);
       const cpX = cx + (cx - (from.x + to.x) / 2) * 0.3;
       const cpY = cy + (cy - (from.y + to.y) / 2) * 0.3;
 
@@ -131,8 +141,8 @@ export function BeatCircle({
     // Draw jump flash
     const flash = jumpFlashRef.current;
     if (flash && flash.opacity > 0) {
-      const from = beatPos(flash.from, n, r, cx);
-      const to = beatPos(flash.to, n, r, cx);
+      const from = beatPos(flash.from, n, r, cx, cy);
+      const to = beatPos(flash.to, n, r, cx, cy);
       const cpX = cx + (cx - (from.x + to.x) / 2) * 0.3;
       const cpY = cy + (cy - (from.y + to.y) / 2) * 0.3;
 
@@ -152,12 +162,18 @@ export function BeatCircle({
 
     // Draw beat dots
     for (let i = 0; i < n; i++) {
-      const pos = beatPos(i, n, r, cx);
+      const pos = beatPos(i, n, r, cx, cy);
       const isActive = i === currentBeat;
       const isAdjacentToActive = Math.abs(i - currentBeat) <= 2;
 
       ctx.beginPath();
-      ctx.arc(pos.x, pos.y, isActive ? ACTIVE_DOT_R * scale : BEAT_DOT_R * scale, 0, 2 * Math.PI);
+      ctx.arc(
+        pos.x,
+        pos.y,
+        (isActive ? ACTIVE_DOT_R : BEAT_DOT_R) * dotScale,
+        0,
+        2 * Math.PI,
+      );
 
       if (isActive) {
         ctx.fillStyle = "#00e5ff";
@@ -175,22 +191,19 @@ export function BeatCircle({
     }
 
     // Playhead sweep line from center to active beat
-    if (n > 0) {
-      const activePos = beatPos(currentBeat, n, r, cx);
-      const gradient = ctx.createLinearGradient(cx, cy, activePos.x, activePos.y);
-      gradient.addColorStop(0, "rgba(0, 229, 255, 0)");
-      gradient.addColorStop(1, "rgba(0, 229, 255, 0.6)");
-      ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.lineTo(activePos.x, activePos.y);
-      ctx.strokeStyle = gradient;
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-    }
+    const activePos = beatPos(currentBeat, n, r, cx, cy);
+    const gradient = ctx.createLinearGradient(cx, cy, activePos.x, activePos.y);
+    gradient.addColorStop(0, "rgba(0, 229, 255, 0)");
+    gradient.addColorStop(1, "rgba(0, 229, 255, 0.6)");
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(activePos.x, activePos.y);
+    ctx.strokeStyle = gradient;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
 
-    prevBeatRef.current = currentBeat;
     animRef.current = requestAnimationFrame(draw);
-  }, [beats, edges, currentBeat, n]); // eslint-disable-line
+  }, []);
 
   useEffect(() => {
     animRef.current = requestAnimationFrame(draw);
@@ -198,62 +211,92 @@ export function BeatCircle({
   }, [draw]);
 
   // Keep canvas bitmap and CSS size in sync with its square container.
+  // We set the canvas bitmap to (size * dpr) so drawing stays crisp on
+  // high-DPI displays, while CSS size stays at `size` so the element
+  // occupies the expected square on the page.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    const parent = canvas.parentElement;
 
     const resize = () => {
       const dpr = window.devicePixelRatio || 1;
-      const size = Math.min(canvas.parentElement?.clientWidth ?? SVG_SIZE, SVG_SIZE);
-      canvas.width = size * dpr;
-      canvas.height = size * dpr;
+      const parentWidth = parent?.clientWidth ?? DESIGN_SIZE;
+      // Respect layout constraints up to the design size, but never collapse
+      // below a usable viewport for touch targets.
+      const size = Math.max(200, Math.min(parentWidth, DESIGN_SIZE));
+      const bitmap = Math.round(size * dpr);
+      if (canvas.width !== bitmap) canvas.width = bitmap;
+      if (canvas.height !== bitmap) canvas.height = bitmap;
       canvas.style.width = `${size}px`;
       canvas.style.height = `${size}px`;
+      sizeRef.current = size;
     };
 
     resize();
-    const observer = new ResizeObserver(resize);
-    if (canvas.parentElement) observer.observe(canvas.parentElement);
+    const observer = typeof ResizeObserver !== "undefined"
+      ? new ResizeObserver(resize)
+      : null;
+    if (observer && parent) observer.observe(parent);
     window.addEventListener("resize", resize);
 
     return () => {
-      observer.disconnect();
+      observer?.disconnect();
       window.removeEventListener("resize", resize);
     };
   }, []);
 
-  const handleCanvasClick = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (!onBeatClick || !n) return;
+  const handlePointer = useCallback(
+    (clientX: number, clientY: number) => {
+      if (!onBeatClick) return;
       const canvas = canvasRef.current;
       if (!canvas) return;
+      const n = beatsRef.current.length;
+      if (!n) return;
 
       const rect = canvas.getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      const scaleX = canvas.width / (rect.width * dpr);
-      const scaleY = canvas.height / (rect.height * dpr);
-      const mx = ((e.clientX - rect.left) * dpr * scaleX) / dpr;
-      const my = ((e.clientY - rect.top) * dpr * scaleY) / dpr;
-      const size = canvas.width / dpr;
-      const scale = size / SVG_SIZE;
+      // clientX/Y minus rect gives us CSS-pixel coordinates inside the
+      // element, which matches how drawing is done after setTransform(dpr).
+      const mx = clientX - rect.left;
+      const my = clientY - rect.top;
+      const size = rect.width || sizeRef.current;
       const { cx, cy, r } = circleGeometry(size);
 
-      // Find closest beat
       let closest = -1;
       let minDist = Infinity;
       for (let i = 0; i < n; i++) {
-        const pos = beatPos(i, n, r, cx);
+        const pos = beatPos(i, n, r, cx, cy);
         const dist = Math.hypot(mx - pos.x, my - pos.y);
         if (dist < minDist) {
           minDist = dist;
           closest = i;
         }
       }
-      if (closest >= 0 && minDist < 20 * scale) {
+      // Generous hit radius on mobile so taps near a dot still land.
+      const hitRadius = Math.max(18, size * 0.04);
+      if (closest >= 0 && minDist < hitRadius) {
         onBeatClick(closest);
       }
     },
-    [n, onBeatClick]
+    [onBeatClick],
+  );
+
+  const handleCanvasClick = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      handlePointer(e.clientX, e.clientY);
+    },
+    [handlePointer],
+  );
+
+  const handleCanvasTouch = useCallback(
+    (e: React.TouchEvent<HTMLCanvasElement>) => {
+      const touch = e.changedTouches[0];
+      if (!touch) return;
+      // Prevent synthetic mouse events from firing a second time.
+      e.preventDefault();
+      handlePointer(touch.clientX, touch.clientY);
+    },
+    [handlePointer],
   );
 
   return (
@@ -261,7 +304,8 @@ export function BeatCircle({
       <canvas
         ref={canvasRef}
         onClick={handleCanvasClick}
-        className="block cursor-pointer"
+        onTouchEnd={handleCanvasTouch}
+        className="block cursor-pointer touch-manipulation select-none"
       />
     </div>
   );
