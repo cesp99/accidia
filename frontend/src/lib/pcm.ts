@@ -2,6 +2,11 @@
 // decoder. We bypass `AudioContext.decodeAudioData` entirely by building
 // an `AudioBuffer` manually, which avoids flaky container-decoding paths
 // in system webviews (notably WebKit2GTK on Linux).
+//
+// Note: there used to also be a `pcmToMonoFloat32` helper here for the
+// in-browser beat analyzer. That pipeline now runs in Go (see
+// `internal/audio/analysis.go`), so the JS path is just "fetch PCM,
+// hand it to Web Audio". One less O(n) main-thread pass per track.
 
 /**
  * Fetch raw little-endian int16 PCM bytes from a URL served by the
@@ -43,24 +48,4 @@ export function pcmToAudioBuffer(
     buffer.copyToChannel(tmp, c);
   }
   return buffer;
-}
-
-/**
- * Mono-mixdown of interleaved int16 PCM, normalised to float. Used by
- * the beat-analysis path which only needs a single channel.
- */
-export function pcmToMonoFloat32(pcm: Int16Array, channels: number): Float32Array {
-  if (channels < 1) throw new Error(`invalid channel count ${channels}`);
-  const frames = Math.floor(pcm.length / channels);
-  const out = new Float32Array(frames);
-  if (channels === 1) {
-    for (let i = 0; i < frames; i++) out[i] = pcm[i] / 32768;
-    return out;
-  }
-  for (let i = 0; i < frames; i++) {
-    let sum = 0;
-    for (let c = 0; c < channels; c++) sum += pcm[i * channels + c];
-    out[i] = sum / channels / 32768;
-  }
-  return out;
 }

@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import { Disc3, Play, Search, Shuffle, User } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { store } from "../../../wailsjs/go/models";
-import { GetCoverArt } from "../../../wailsjs/go/main/App";
+import { useCoverArt } from "@/lib/cover-cache";
 
 type Track = store.Track;
 
@@ -148,43 +148,11 @@ export function groupByArtist(tracks: Track[]): ArtistGroup[] {
   return Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name));
 }
 
-// ---------------------------------------------------------------------------
-// Cover-art fetcher
-// ---------------------------------------------------------------------------
-
-// A small cache so switching between modes doesn't re-fetch art we've
-// already loaded. Keyed by the track path the art came from.
-const coverCache = new Map<string, string | null>();
-
-function useCoverArt(source?: string): string | null {
-  const [art, setArt] = useState<string | null>(() =>
-    source ? coverCache.get(source) ?? null : null,
-  );
-  const requested = useRef(false);
-  useEffect(() => {
-    if (!source) {
-      setArt(null);
-      return;
-    }
-    const cached = coverCache.get(source);
-    if (cached !== undefined) {
-      setArt(cached);
-      return;
-    }
-    if (requested.current) return;
-    requested.current = true;
-    let cancelled = false;
-    GetCoverArt(source).then((url) => {
-      const resolved = url || null;
-      coverCache.set(source, resolved);
-      if (!cancelled) setArt(resolved);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [source]);
-  return art;
-}
+// Cover-art fetching now lives in `@/lib/cover-cache` so it's shared
+// across every component that displays album/artist art (this file plus
+// track-list's AlbumGroupCard plus App.tsx's pre-warm). That single
+// cache is what lets us hit "Albums" → "All" → "Albums" without a
+// fresh IPC roundtrip per card.
 
 // ---------------------------------------------------------------------------
 // AlbumsGrid — tile view of the library grouped by album
@@ -192,14 +160,25 @@ function useCoverArt(source?: string): string | null {
 
 interface AlbumsGridProps {
   tracks: Track[];
+  /**
+   * Pre-computed album groups. When provided we skip the local
+   * `groupByAlbum(tracks)` pass entirely — the parent already memoised
+   * the result against a stable libraryTracks reference. The legacy
+   * code path (computing on mount) is still here as a fallback for any
+   * caller that hasn't migrated yet.
+   */
+  groups?: AlbumGroup[];
   onSelect: (album: AlbumGroup) => void;
   onPlay: (album: AlbumGroup) => void;
   onShuffle: (album: AlbumGroup) => void;
 }
 
-export function AlbumsGrid({ tracks, onSelect, onPlay, onShuffle }: AlbumsGridProps) {
+export function AlbumsGrid({ tracks, groups: providedGroups, onSelect, onPlay, onShuffle }: AlbumsGridProps) {
   const [query, setQuery] = useState("");
-  const groups = useMemo(() => groupByAlbum(tracks), [tracks]);
+  const groups = useMemo(
+    () => providedGroups ?? groupByAlbum(tracks),
+    [providedGroups, tracks],
+  );
   const filtered = useMemo(() => {
     if (!query.trim()) return groups;
     const q = query.toLowerCase();
@@ -315,14 +294,19 @@ function AlbumCard({
 
 interface ArtistsListProps {
   tracks: Track[];
+  /** Pre-computed artist groups (see AlbumsGridProps for rationale). */
+  groups?: ArtistGroup[];
   onSelect: (artist: ArtistGroup) => void;
   onPlay: (artist: ArtistGroup) => void;
   onShuffle: (artist: ArtistGroup) => void;
 }
 
-export function ArtistsList({ tracks, onSelect, onPlay, onShuffle }: ArtistsListProps) {
+export function ArtistsList({ tracks, groups: providedGroups, onSelect, onPlay, onShuffle }: ArtistsListProps) {
   const [query, setQuery] = useState("");
-  const groups = useMemo(() => groupByArtist(tracks), [tracks]);
+  const groups = useMemo(
+    () => providedGroups ?? groupByArtist(tracks),
+    [providedGroups, tracks],
+  );
   const filtered = useMemo(() => {
     if (!query.trim()) return groups;
     const q = query.toLowerCase();

@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ChevronDown, Disc3, Heart, Play, Search } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { store } from "../../../wailsjs/go/models";
-import { GetCoverArt } from "../../../wailsjs/go/main/App";
 import { TrackContextMenu } from "./track-context-menu";
 import { groupByAlbum, type AlbumGroup } from "./library-browsers";
+import { useCoverArt } from "@/lib/cover-cache";
 import type { Playlist } from "@/hooks/use-playlists";
 
 type Track = store.Track;
@@ -58,6 +58,15 @@ interface TrackListProps {
   hideSearch?: boolean;
   /** Extra content to render alongside the heading (e.g. "Play all" button). */
   headerActions?: React.ReactNode;
+  /**
+   * Precomputed album groups for the *full* `tracks` list (no search
+   * filter applied). When provided, and the user hasn't typed a query,
+   * we skip the local `groupByAlbum` pass entirely. The parent caches
+   * the groups against a stable libraryTracks reference, so switching
+   * tabs doesn't keep recomputing the same buckets. With a query we
+   * fall back to grouping the filtered subset locally.
+   */
+  groups?: AlbumGroup[];
 }
 
 export function TrackList({
@@ -80,20 +89,29 @@ export function TrackList({
   heading = "Library",
   hideSearch = false,
   headerActions,
+  groups: providedGroups,
 }: TrackListProps) {
   const [query, setQuery] = useState("");
+  const trimmedQuery = query.trim();
   const filtered = useMemo(() => {
-    if (!query.trim()) return tracks;
-    const q = query.toLowerCase();
+    if (!trimmedQuery) return tracks;
+    const q = trimmedQuery.toLowerCase();
     return tracks.filter(
       (t) =>
         t.title.toLowerCase().includes(q) ||
         t.artist?.toLowerCase().includes(q) ||
         t.album?.toLowerCase().includes(q),
     );
-  }, [tracks, query]);
+  }, [tracks, trimmedQuery]);
 
-  const groups = useMemo(() => (flat ? [] : groupByAlbum(filtered)), [filtered, flat]);
+  // Reuse the parent-cached groups whenever possible — they're already
+  // memoised against the stable libraryTracks reference. A typed query
+  // forces a fresh group pass over the filtered subset.
+  const groups = useMemo(() => {
+    if (flat) return [];
+    if (!trimmedQuery && providedGroups) return providedGroups;
+    return groupByAlbum(filtered);
+  }, [flat, trimmedQuery, providedGroups, filtered]);
 
   // Per-album collapse state, persisted so the user's choices survive
   // app restarts. A group key is in the set iff that album is collapsed.
@@ -255,20 +273,10 @@ function AlbumGroupCard({
   onPlay: (track: Track) => void;
   onPlayAlbum: () => void;
 } & RowCommonProps) {
-  const [artwork, setArtwork] = useState<string | null>(null);
-  const requested = useRef(false);
-
-  useEffect(() => {
-    if (requested.current || !group.artworkSource) return;
-    requested.current = true;
-    let cancelled = false;
-    GetCoverArt(group.artworkSource).then((url) => {
-      if (!cancelled) setArtwork(url || null);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [group.artworkSource]);
+  // Shared cover-art cache: the same source path used here is also used
+  // by AlbumsGrid + ArtistsList, so the first paint of the Library tab
+  // populates a single cache that subsequent tabs read from for free.
+  const artwork = useCoverArt(group.artworkSource);
 
   // If the current track belongs to this album, keep it visible even
   // when the user had previously collapsed the card — it's disorienting

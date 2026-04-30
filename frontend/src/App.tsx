@@ -6,7 +6,14 @@ import { PlayerBar } from "@/components/shell/player-bar";
 import { NowPlaying } from "@/components/shell/now-playing";
 import { LyricsView } from "@/components/shell/lyrics-view";
 import { LibraryView } from "@/components/library/library-view";
+import { groupByAlbum, groupByArtist } from "@/components/library/library-browsers";
 import { FavoritesView, PlaylistView, PlaylistPrompt } from "@/components/library/collection-views";
+import {
+  getCachedCover,
+  loadCover,
+  pruneCoverCache,
+  prewarmCovers,
+} from "@/lib/cover-cache";
 import { QueueDrawer } from "@/components/shell/queue-drawer";
 import { SettingsView } from "@/components/shell/settings-view";
 import { EffectsPanel } from "@/components/jukebox/effects-panel";
@@ -22,11 +29,11 @@ import { useQueue, type PlaybackSource, type Track } from "@/hooks/use-queue";
 import { useFavorites } from "@/hooks/use-favorites";
 import { usePlaylists, type Playlist } from "@/hooks/use-playlists";
 import { defaultEffectsState } from "@/lib/audio-effects";
-import { analyzeMonoPcm, buildMinimalAnalysis } from "@/lib/audio-analysis";
-import { fetchPcm, pcmToAudioBuffer, pcmToMonoFloat32 } from "@/lib/pcm";
+import { buildMinimalAnalysis } from "@/lib/audio-analysis";
+import { fetchPcm, pcmToAudioBuffer } from "@/lib/pcm";
 import {
+  CaptureWindowState,
   DecodeTrack,
-  GetCoverArt,
   GetHostInfo,
   LoadSettings,
   MprisUpdateCapabilities,
@@ -34,10 +41,11 @@ import {
   MprisUpdatePlaybackStatus,
   MprisUpdatePosition,
   PrefetchTrack,
-  SaveSettings,
+  SaveUserSettings,
+  ShowWindow,
 } from "../wailsjs/go/main/App";
 import { EventsOn, LogError, LogInfo } from "../wailsjs/runtime/runtime";
-import type { main, store } from "../wailsjs/go/models";
+import type { audio, main, store } from "../wailsjs/go/models";
 
 interface NowPlayingTrack {
   path: string;
@@ -64,6 +72,41 @@ export default function App() {
   // All known tracks from the library scan, hoisted here so favorites / playlist
   // views can join against them by path.
   const [libraryTracks, setLibraryTracks] = useState<store.Track[]>([]);
+
+  // Album + artist groupings computed once per `libraryTracks` reference.
+  // Pulling these up here means switching between Library / Albums /
+  // Artists tabs reuses the same buckets — no per-tab `groupBy` pass and
+  // (combined with the shared cover cache) no per-tab cover-art IPC fan-out.
+  const albumGroups = useMemo(() => groupByAlbum(libraryTracks), [libraryTracks]);
+  const artistGroups = useMemo(() => groupByArtist(libraryTracks), [libraryTracks]);
+
+  // Whenever the library changes (initial load, rescan, folder swap)
+  // evict cover-art entries for paths that no longer exist and pre-warm
+  // the cache for the new set of cover sources. Pre-warming overlaps the
+  // IPC fan-out with the user's first interactions instead of stalling
+  // the first tab switch on it.
+  useEffect(() => {
+    if (libraryTracks.length === 0) return;
+    const sources: string[] = [];
+    const live = new Set<string>();
+    for (const g of albumGroups) {
+      if (g.artworkSource) {
+        sources.push(g.artworkSource);
+        live.add(g.artworkSource);
+      }
+    }
+    for (const g of artistGroups) {
+      if (g.artworkSource && !live.has(g.artworkSource)) {
+        sources.push(g.artworkSource);
+        live.add(g.artworkSource);
+      }
+    }
+    // Evict any cached covers whose source path is gone from the new library.
+    pruneCoverCache(live);
+    // Fire-and-forget — failures are non-fatal, individual hooks will
+    // simply re-fetch when mounted.
+    prewarmCovers(sources).catch(() => {});
+  }, [libraryTracks, albumGroups, artistGroups]);
 
   // Queue drawer visibility.
   const [queueOpen, setQueueOpen] = useState(false);
@@ -111,9 +154,20 @@ export default function App() {
   });
   const [effectsState, setEffectsStateLocal] = useState<EffectsState>(defaultEffectsState);
   const [volume, setVolumeLocal] = useState(1);
-  const [backdropOpacity, setBackdropOpacity] = useState(1);
+  // backdropOpacity starts as null (unknown) rather than 1.0 so the
+  // backdrop component can short-circuit its first render to "blank /
+  // transparent" while the persisted value is loading. This is what
+  // prevents the startup flash of "fully opaque background → user's
+  // chosen translucency" — the window doesn't get shown until the
+  // value is in place. See also `settingsApplied` below.
+  const [backdropOpacity, setBackdropOpacity] = useState<number | null>(null);
 
   const settingsLoaded = useRef(false);
+  // True once we've applied the persisted settings (or determined
+  // there are none). The post-apply effect uses this to call
+  // `ShowWindow()` exactly once, revealing the now-correctly-styled
+  // window without the user ever seeing the default-state flash.
+  const [settingsApplied, setSettingsApplied] = useState(false);
 
   // Host + settings bootstrap.
   useEffect(() => {
@@ -139,15 +193,52 @@ export default function App() {
           };
           setJumpSettingsState(next);
         }
-        if (typeof s.backdropOpacity === "number" && s.backdropOpacity > 0) {
-          setBackdropOpacity(Math.max(0, Math.min(1, s.backdropOpacity)));
-        }
+        const opacity =
+          typeof s.backdropOpacity === "number" && s.backdropOpacity > 0
+            ? Math.max(0, Math.min(1, s.backdropOpacity))
+            : 1;
+        setBackdropOpacity(opacity);
         settingsLoaded.current = true;
+        setSettingsApplied(true);
       })
       .catch(() => {
+        // Failure path: still resolve to the default opacity so the
+        // app is usable, just without persisted preferences.
+        setBackdropOpacity(1);
         settingsLoaded.current = true;
+        setSettingsApplied(true);
       });
   }, [setVolume]);
+
+  // Reveal the window after the first paint that includes the
+  // persisted backdrop opacity. Two-frame requestAnimationFrame so
+  // the browser has actually flushed the styles to the GPU before
+  // ShowWindow() pops the window in — guards against compositor
+  // races where `display: none → block` would otherwise show one
+  // frame of stale state.
+  const windowRevealed = useRef(false);
+  useEffect(() => {
+    if (!settingsApplied || windowRevealed.current) return;
+    let cancelled = false;
+    let r2 = 0;
+    const reveal = () => {
+      if (cancelled || windowRevealed.current) return;
+      windowRevealed.current = true;
+      ShowWindow().catch(() => {});
+    };
+    const r1 = requestAnimationFrame(() => {
+      r2 = requestAnimationFrame(reveal);
+    });
+    // Hidden windows may throttle/skip rAF entirely on some platforms.
+    // Fallback so startup doesn't get stuck invisible.
+    const fallback = window.setTimeout(reveal, 160);
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(r1);
+      if (r2) cancelAnimationFrame(r2);
+      window.clearTimeout(fallback);
+    };
+  }, [settingsApplied]);
 
   // Every time the intent or the jukebox toggle changes, re-sync the engine.
   useEffect(() => {
@@ -157,20 +248,52 @@ export default function App() {
     });
   }, [jukeboxActive, jumpSettings, setJumpSettings]);
 
-  // Persist settings.
+  // Persist user-controlled settings. Window geometry + libraryRoot
+  // are owned by Go (CaptureWindowState / ScanLibrary) so we use the
+  // narrow SaveUserSettings binding rather than the legacy
+  // SaveSettings, which would otherwise overwrite Go's window state
+  // with zeros every time the user touched a slider.
   useEffect(() => {
-    if (!settingsLoaded.current) return;
-    SaveSettings({
+    if (!settingsLoaded.current || backdropOpacity === null) return;
+    SaveUserSettings({
       volume,
       jumpProbability: jumpSettings.jumpProbability,
       jumpCooldown: jumpSettings.minSecondsBetweenJumps,
-      libraryRoot: "",
-      lastTrackPath: track?.path ?? "",
-      windowWidth: 0,
-      windowHeight: 0,
       backdropOpacity,
-    } as store.Settings).catch(() => {});
+      lastTrackPath: track?.path ?? "",
+    }).catch(() => {});
   }, [volume, jumpSettings, track?.path, backdropOpacity]);
+
+  // Periodically snapshot the window geometry so a hard crash doesn't
+  // lose the user's chosen position. The shutdown hook also captures,
+  // but only on a clean exit. We only fire when the window has had
+  // time to settle (debounced via the resize listener) and after a
+  // user-initiated move (no native event for that on Wails v2, so we
+  // poll lazily on focus / page-visibility changes — cheap and good
+  // enough).
+  useEffect(() => {
+    if (!settingsApplied) return;
+    let captureTimer: number | undefined;
+    const scheduleCapture = () => {
+      if (captureTimer !== undefined) window.clearTimeout(captureTimer);
+      captureTimer = window.setTimeout(() => {
+        CaptureWindowState().catch(() => {});
+      }, 800);
+    };
+    const onResize = () => scheduleCapture();
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") scheduleCapture();
+    };
+    window.addEventListener("resize", onResize);
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("blur", scheduleCapture);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("blur", scheduleCapture);
+      if (captureTimer !== undefined) window.clearTimeout(captureTimer);
+    };
+  }, [settingsApplied]);
 
   const handleVolume = useCallback(
     (next: number) => {
@@ -218,67 +341,57 @@ export default function App() {
   // the peek-next track so hitting Next is effectively instant.
   // -----------------------------------------------------------------
 
-  // Guards against a stale analysis finishing after the user has
-  // already switched to a different track.
+  // Guards against a stale load completing after the user has already
+  // switched to a different track.
   const loadTokenRef = useRef(0);
 
-  // Deferred analysis input for the *current* track. Populated on load,
-  // cleared after the heavy analysis runs (or on track change). We store
-  // just what analyzeMonoPcm needs: the mono float buffer + metadata.
-  // Beat analysis on a 4-minute song is ~500-1500ms on the main thread,
-  // so we only run it when Infinite Jukebox is actually on — otherwise
-  // track switching is faster and the user never pays for a feature
-  // they don't use.
-  const pendingAnalysisRef = useRef<{
-    trackPath: string;
-    token: number;
-    mono: Float32Array;
-    sampleRate: number;
-    duration: number;
-    displayTitle: string;
-  } | null>(null);
-
-  // Runs the heavy analyzeMonoPcm pass on whatever is in
-  // pendingAnalysisRef and swaps the result into the audio engine. No-op
-  // if nothing is pending (already analysed / different track).
-  const runAnalysisNow = useCallback(() => {
-    const p = pendingAnalysisRef.current;
-    if (!p) return;
-    if (p.token !== loadTokenRef.current) {
-      pendingAnalysisRef.current = null;
-      return;
-    }
-    try {
-      const real = analyzeMonoPcm(p.mono, p.sampleRate, p.duration, p.displayTitle);
-      if (p.token !== loadTokenRef.current) return;
-      updateAnalysis(real);
-      setTrack((prev) =>
-        prev && prev.path === p.trackPath
-          ? { ...prev, analysis: { ...real, title: prev.title } }
-          : prev,
-      );
-    } catch (e) {
-      console.warn("[analyze]", e);
-    } finally {
-      // Free the mono buffer regardless — we don't re-analyze.
-      pendingAnalysisRef.current = null;
-      setAnalyzing(false);
-    }
-  }, [updateAnalysis]);
+  // Convert the Go-side audio.Analysis (or any compatible payload)
+  // into the engine's AnalysisData shape. Returns null when the input
+  // is missing or doesn't have enough beats to be useful — callers
+  // fall back to buildMinimalAnalysis in that case.
+  const adoptGoAnalysis = useCallback(
+    (raw: audio.Analysis | undefined | null, fallbackTitle: string): AnalysisData | null => {
+      if (!raw) return null;
+      if (!raw.beats || raw.beats.length === 0) return null;
+      return {
+        title: raw.title || fallbackTitle,
+        bpm: raw.bpm,
+        duration: raw.duration,
+        n_beats: raw.n_beats,
+        beats: raw.beats.map((b) => ({ index: b.index, time: b.time })),
+        edges: (raw.edges ?? []).map((e) => ({
+          from: e.from,
+          to: e.to,
+          similarity: e.similarity,
+        })),
+      };
+    },
+    [],
+  );
 
   const loadAndPlayTrack = useCallback(
     async (t: store.Track): Promise<boolean> => {
       setError(null);
       const token = ++loadTokenRef.current;
-      // Invalidate any previous track's pending analysis.
-      pendingAnalysisRef.current = null;
 
-      let phase: "decode" | "fetch" | "playback" | "analyze" = "decode";
+      let phase: "decode" | "fetch" | "playback" = "decode";
       try {
-        const [decoded, cover] = await Promise.all([
-          DecodeTrack(t.path),
-          t.hasCoverArt ? GetCoverArt(t.path) : Promise.resolve(""),
-        ]);
+        // Cover art runs alongside decoding. We don't await it up
+        // front because GetCoverArt re-reads the file's tag chunk —
+        // for prefetched (cache-hit) DecodeTrack calls the cover IPC
+        // can dominate the hot path. Instead we kick it off and let
+        // the result land asynchronously, updating the track view
+        // when it arrives.
+        //
+        // Synchronous cache hit is preferred so we paint the right
+        // cover from frame one (replays + tracks whose art was
+        // pre-warmed by the library tab). Misses paint with no cover
+        // for one frame and patch in once `loadCover` resolves.
+        const cachedCover = t.hasCoverArt ? getCachedCover(t.path) : null;
+        const coverPromise: Promise<string | null> = t.hasCoverArt
+          ? loadCover(t.path)
+          : Promise.resolve(null);
+        const decoded = await DecodeTrack(t.path);
         if (token !== loadTokenRef.current) return false;
         if (!decoded.mediaUrl) {
           throw new Error("Go decoder returned no media URL");
@@ -298,10 +411,16 @@ export default function App() {
           decoded.channels,
           decoded.frames,
         );
-        // Start with a cheap stand-in analysis so playback can begin
-        // without waiting for the full beat-detection pass.
-        const minimal = buildMinimalAnalysis(decoded.duration, displayTitle);
-        await loadAudio(audioBuffer, minimal);
+        // Beat analysis is now computed in Go (off the main thread)
+        // and disk-cached by file (path, mtime). DecodeTrack returns
+        // the result inline so the frontend just consumes it. We
+        // still keep buildMinimalAnalysis as a defensive fallback
+        // for tracks where Go couldn't find a usable beat grid
+        // (very short clips, dead silence, etc.).
+        const goAnalysis = adoptGoAnalysis(decoded.analysis, displayTitle);
+        const initialAnalysis =
+          goAnalysis ?? buildMinimalAnalysis(decoded.duration, displayTitle);
+        await loadAudio(audioBuffer, initialAnalysis);
 
         const effectiveTitle = t.title || displayTitle;
         const effectiveArtist = decoded.artist || t.artist || "";
@@ -310,11 +429,14 @@ export default function App() {
         setTrack({
           path: t.path,
           title: effectiveTitle,
+          // If we already had art cached from the library view, paint
+          // with it so there's no flicker. Cache misses fall through
+          // to the async patch below.
+          coverUrl: cachedCover ?? null,
           artist: effectiveArtist,
           album: effectiveAlbum,
-          coverUrl: cover || null,
           analysis: {
-            ...minimal,
+            ...initialAnalysis,
             title: effectiveTitle,
           },
           raw: t,
@@ -324,27 +446,24 @@ export default function App() {
         setVolume(volume);
         play();
 
-        // Park the mono + metadata for an optional later analysis. It
-        // only happens if the Infinite Jukebox is (or becomes) active —
-        // see the jukeboxActive effect below. The main-thread cost of
-        // pcmToMonoFloat32 itself is modest (O(n) single pass) so we do
-        // it now to keep the heavier analyzeMonoPcm simple.
-        phase = "analyze";
-        pendingAnalysisRef.current = {
-          trackPath: t.path,
-          token,
-          mono: pcmToMonoFloat32(pcm, decoded.channels),
-          sampleRate: decoded.sampleRate,
-          duration: decoded.duration,
-          displayTitle,
-        };
+        // The "analyzing…" indicator was used to flag the period
+        // between play start and the heavy JS pass finishing. With
+        // analysis now coming inline from Go (or arriving cached
+        // from disk) there's never that gap, so we always settle on
+        // false here.
+        setAnalyzing(false);
 
-        if (jukeboxActive) {
-          setAnalyzing(true);
-          scheduleIdle(() => runAnalysisNow());
-        } else {
-          setAnalyzing(false);
-        }
+        // Resolve the cover and patch the track in place once it's
+        // ready. No-op when cachedCover already matches.
+        coverPromise.then((cover) => {
+          if (token !== loadTokenRef.current) return;
+          if (!cover) return;
+          setTrack((prev) =>
+            prev && prev.path === t.path && prev.coverUrl !== cover
+              ? { ...prev, coverUrl: cover }
+              : prev,
+          );
+        });
 
         return true;
       } catch (e) {
@@ -367,20 +486,9 @@ export default function App() {
       setVolume,
       effectsState,
       volume,
-      jukeboxActive,
-      runAnalysisNow,
+      adoptGoAnalysis,
     ],
   );
-
-  // When the user toggles Infinite Jukebox on, analyse the *current*
-  // track if we skipped analysis at load time. This is why we held onto
-  // the mono buffer above.
-  useEffect(() => {
-    if (!jukeboxActive) return;
-    if (!pendingAnalysisRef.current) return;
-    setAnalyzing(true);
-    scheduleIdle(() => runAnalysisNow());
-  }, [jukeboxActive, runAnalysisNow]);
 
   // Prefetch the "next" track in the background so hitting Next is instant.
   // We only start the prefetch once the current track has been loaded and
@@ -422,8 +530,11 @@ export default function App() {
   //                             if no jump lands at the end we loop
   //                             rather than pause)
   //   repeat === "one"        → engine auto-loops (single-track repeat)
-  //   otherwise               → engine fires onTrackEnd → we advance
-  //                             to queue.next() or pause if empty.
+  //   otherwise               → engine fires onTrackEnd:
+  //                               - if Up Next has entries, consume one
+  //                               - if shuffle is on, advance to a random
+  //                                 next track from the active source
+  //                               - otherwise pause
   //
   // We use refs for `queue.next` + `pause` so the effect body can be
   // stable and the callback registered on the engine doesn't churn
@@ -437,17 +548,22 @@ export default function App() {
 
   useEffect(() => {
     const shouldLoop = jukeboxActive || queue.state.repeat === "one";
+    const hasQueuedNext = queue.state.upNext.length > 0;
+    const shouldAdvanceOnEnd = hasQueuedNext || queue.state.shuffle;
     setShouldLoop(shouldLoop);
     if (shouldLoop) {
       setOnTrackEnd(null);
     } else {
       setOnTrackEnd(() => {
-        const nxt = queueNextRef.current();
-        if (!nxt) pauseRef.current();
+        if (shouldAdvanceOnEnd) {
+          queueNextRef.current();
+          return;
+        }
+        pauseRef.current();
       });
     }
     return () => setOnTrackEnd(null);
-  }, [jukeboxActive, queue.state.repeat, setShouldLoop, setOnTrackEnd]);
+  }, [jukeboxActive, queue.state.repeat, queue.state.shuffle, queue.state.upNext.length, setShouldLoop, setOnTrackEnd]);
 
   const handlePlayPause = useCallback(() => {
     if (!track) return;
@@ -1002,6 +1118,8 @@ export default function App() {
             onAddToPlaylist={handleAddToPlaylist}
             onCreatePlaylistWithTracks={handleCreatePlaylistWithTracks}
             onLibraryLoad={(lib) => setLibraryTracks(lib.tracks)}
+            albumGroups={albumGroups}
+            artistGroups={artistGroups}
           />
         );
     }
@@ -1029,6 +1147,8 @@ export default function App() {
     handleCreatePlaylistWithTracks,
     handleRemoveFromCurrentPlaylist,
     libraryTracks,
+    albumGroups,
+    artistGroups,
     currentPlaylist,
     backdropOpacity,
     appVersion,

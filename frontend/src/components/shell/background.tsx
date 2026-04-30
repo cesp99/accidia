@@ -11,8 +11,14 @@ interface BlurBackgroundProps {
    * OS desktop is completely hidden. Values <1 let the compositor's
    * blur / vibrancy show the wallpaper through. User-controlled from
    * the Settings tab.
+   *
+   * Pass `null` (or omit) while the persisted value is still loading
+   * — the component will render no base layer at all in that state,
+   * which keeps the first paint flicker-free. The window is held
+   * hidden by Wails until the value lands; this prop type lets us
+   * model that explicitly.
    */
-  backdropOpacity?: number;
+  backdropOpacity?: number | null;
 }
 
 /** Cap the cover-art layer at this opacity to keep the UI readable. */
@@ -33,8 +39,17 @@ const COVER_MAX_OPACITY = 0.1;
  * globals.css so platforms with native translucency (macOS vibrancy,
  * Windows Mica, Linux compositor blur) can do their thing — this
  * component is the single source of truth for the in-app backdrop.
+ *
+ * The blurred cover layer keeps `animate-slow-pan` active even when
+ * paused (with `animation-play-state: paused`) instead of toggling
+ * the class on/off. Removing the class fell off the GPU compositor,
+ * which made WebKit re-rasterise the 100px blur with a different
+ * algorithm and the whole window subtly darkened on every pause —
+ * the "UI gets strangely darker when paused" symptom users hit.
+ * Keeping the class always-on pins the layer on the compositor and
+ * keeps the rendered colour stable across play/pause.
  */
-export function BlurBackground({ coverUrl, isPlaying, backdropOpacity = 1 }: BlurBackgroundProps) {
+export function BlurBackground({ coverUrl, isPlaying, backdropOpacity }: BlurBackgroundProps) {
   const [layers, setLayers] = useState<{ url: string; key: number }[]>([]);
   const counter = useRef(0);
 
@@ -53,6 +68,12 @@ export function BlurBackground({ coverUrl, isPlaying, backdropOpacity = 1 }: Blu
     return () => clearTimeout(t);
   }, [coverUrl]);
 
+  // Until the persisted opacity is known we render *nothing* for the
+  // base layer — that keeps the first paint at zero flicker risk
+  // (the window is still hidden by Wails at this point anyway).
+  const baseOpacity =
+    backdropOpacity == null ? null : Math.max(0, Math.min(1, backdropOpacity));
+
   return (
     <div
       aria-hidden
@@ -60,26 +81,30 @@ export function BlurBackground({ coverUrl, isPlaying, backdropOpacity = 1 }: Blu
     >
       {/* Opaque base — masks the desktop bleed-through. Opacity is
           user-tunable via Settings (backdropOpacity). */}
-      <div
-        className="absolute inset-0 bg-background transition-opacity duration-300"
-        style={{ opacity: Math.max(0, Math.min(1, backdropOpacity)) }}
-      />
+      {baseOpacity !== null && (
+        <div
+          className="absolute inset-0 bg-background transition-opacity duration-300"
+          style={{ opacity: baseOpacity }}
+        />
+      )}
 
-      {/* Blurred cover art — only rendered when a track is loaded. */}
+      {/* Blurred cover art — only rendered when a track is loaded.
+          Animation stays active permanently to keep the layer pinned
+          to the GPU compositor (see file-level comment). */}
       {layers.map((layer) => (
         <div
           key={layer.key}
           className={cn(
             "absolute inset-0 transition-opacity duration-[1200ms]",
-            isPlaying && "animate-slow-pan",
+            "animate-slow-pan will-change-transform",
           )}
           style={{
             backgroundImage: `url(${layer.url})`,
             backgroundSize: "cover",
             backgroundPosition: "center",
             filter: "blur(100px) saturate(140%)",
-            transform: "scale(1.2)",
             opacity: COVER_MAX_OPACITY,
+            animationPlayState: isPlaying ? "running" : "paused",
           }}
         />
       ))}

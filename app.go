@@ -115,6 +115,13 @@ func (a *App) Media() *media.Store { return a.media }
 // startup is called by Wails once the underlying window has been created
 // but before the JS bridge is fully ready. We stash the context so we can
 // emit events back to the frontend later.
+//
+// This is also where we apply the persisted window geometry so the
+// startup is flicker-free: the window is created hidden (StartHidden:
+// true), we move/size it to where the user last left it, and the
+// frontend calls ShowWindow() once it's done applying the persisted
+// backdrop opacity. The user never sees the default 1280×820 box at
+// (some-random-position) before the saved state lands.
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	if err := a.store.Init(); err != nil {
@@ -131,6 +138,65 @@ func (a *App) startup(ctx context.Context) {
 		wruntime.LogInfo(ctx, "mpris: registered on org.mpris.MediaPlayer2.accidia")
 	}
 	a.library.AttachContext(ctx)
+	a.applyPersistedWindowGeometry()
+}
+
+// applyPersistedWindowGeometry restores the saved window size + position
+// from settings, falling back to centering the default-sized window on
+// the active display when nothing is saved. Called from startup() while
+// the window is still hidden.
+func (a *App) applyPersistedWindowGeometry() {
+	s := a.store.Settings()
+	// Size first — the WM may otherwise centre using the default size,
+	// which would put a wide-aspect window in the wrong screen quadrant
+	// when we then move it.
+	if s.WindowWidth >= 600 && s.WindowHeight >= 400 {
+		wruntime.WindowSetSize(a.ctx, s.WindowWidth, s.WindowHeight)
+	}
+	if s.HasWindowPos {
+		// Trust the persisted position even when zero — the user may
+		// legitimately have left the window in the upper-left corner.
+		wruntime.WindowSetPosition(a.ctx, s.WindowX, s.WindowY)
+	} else {
+		// Fresh install: centre on the active screen so the first
+		// reveal isn't wherever the WM happens to drop a frameless
+		// transparent window (varies by compositor, sometimes
+		// unsightly).
+		wruntime.WindowCenter(a.ctx)
+	}
+}
+
+// ShowWindow reveals the (currently hidden) main window. The frontend
+// calls this once it has finished its first paint with the persisted
+// settings applied — that ordering is what gives us a flicker-free
+// startup. Idempotent: calling it on an already-visible window is a
+// safe no-op via Wails.
+func (a *App) ShowWindow() { wruntime.WindowShow(a.ctx) }
+
+// CaptureWindowState snapshots the current window geometry into
+// settings without writing to disk yet. Useful for periodic in-flight
+// captures from the frontend (e.g. after the user finishes a drag) so
+// a hard crash doesn't lose the new position.
+func (a *App) CaptureWindowState() {
+	if a.ctx == nil {
+		return
+	}
+	w, h := wruntime.WindowGetSize(a.ctx)
+	x, y := wruntime.WindowGetPosition(a.ctx)
+	if w < 600 || h < 400 {
+		// Plausibly a bogus reading during a transition — skip the
+		// snapshot rather than persisting garbage geometry.
+		return
+	}
+	cur := a.store.Settings()
+	cur.WindowWidth = w
+	cur.WindowHeight = h
+	cur.WindowX = x
+	cur.WindowY = y
+	cur.HasWindowPos = true
+	if err := a.store.SaveSettings(cur); err != nil {
+		wruntime.LogWarningf(a.ctx, "capture window state: %v", err)
+	}
 }
 
 // domReady runs once the frontend has finished hydrating and the JS
@@ -141,7 +207,13 @@ func (a *App) domReady(ctx context.Context) {
 
 // beforeClose lets us veto a window close (e.g. for "Save before quit?").
 // Returning true cancels the close.
+//
+// We snapshot the window geometry here rather than in shutdown — by
+// the time shutdown fires the underlying GTK/Cocoa/Win32 window has
+// already been destroyed and querying its size/position returns stale
+// or zeroed values. beforeClose runs while the window is still alive.
 func (a *App) beforeClose(ctx context.Context) bool {
+	a.CaptureWindowState()
 	return false
 }
 
@@ -267,8 +339,39 @@ func (a *App) GetCoverArt(path string) (string, error) {
 // LoadSettings returns whatever settings the user previously persisted.
 func (a *App) LoadSettings() (store.Settings, error) { return a.store.Settings(), nil }
 
-// SaveSettings persists the given settings.
+// SaveSettings persists the given settings *as a whole*. The frontend
+// historically used this to write back its in-memory settings struct
+// each time anything changed — which had the side-effect of clobbering
+// the Go-owned window geometry (windowX/Y/W/H + hasWindowPos) with
+// zeros every save. Prefer SaveUserSettings for routine UI-driven
+// persistence; SaveSettings remains for the rare case where a caller
+// genuinely owns the full struct.
 func (a *App) SaveSettings(s store.Settings) error { return a.store.SaveSettings(s) }
+
+// UserSettings is the subset of settings the frontend is allowed to
+// write directly. Window geometry + libraryRoot are deliberately
+// excluded — they're owned by Go (window state via CaptureWindowState,
+// libraryRoot via ScanLibrary).
+type UserSettings struct {
+	Volume          float64 `json:"volume"`
+	JumpProbability float64 `json:"jumpProbability"`
+	JumpCooldown    float64 `json:"jumpCooldown"`
+	BackdropOpacity float64 `json:"backdropOpacity"`
+	LastTrackPath   string  `json:"lastTrackPath"`
+}
+
+// SaveUserSettings merges the given user-controllable fields into the
+// current settings without touching window geometry or libraryRoot.
+// This is the preferred way for the frontend to persist preferences.
+func (a *App) SaveUserSettings(in UserSettings) error {
+	cur := a.store.Settings()
+	cur.Volume = in.Volume
+	cur.JumpProbability = in.JumpProbability
+	cur.JumpCooldown = in.JumpCooldown
+	cur.BackdropOpacity = in.BackdropOpacity
+	cur.LastTrackPath = in.LastTrackPath
+	return a.store.SaveSettings(cur)
+}
 
 // -----------------------------------------------------------------------
 // Lyrics — fetched from LRCLIB (free, CC0). See internal/lyrics.

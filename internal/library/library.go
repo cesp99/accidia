@@ -5,7 +5,10 @@ package library
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -96,6 +99,12 @@ type DecodedAudio struct {
 	// by MediaStore. Example: "/media/a1b2c3…". Lifetime is bounded by the
 	// MediaStore LRU — the frontend should fetch promptly.
 	MediaURL string `json:"mediaUrl"`
+	// Analysis is the beat graph the frontend feeds into the Infinite
+	// Jukebox engine. Computed in Go (off the React main thread) and
+	// disk-cached per (path, mtime) so re-plays skip the heavy
+	// detection pass entirely. Pointer so a JSON omitempty kicks in
+	// when the caller didn't request analysis.
+	Analysis *audio.Analysis `json:"analysis,omitempty"`
 }
 
 // Library is the long-lived service that scans, caches, and serves audio
@@ -117,6 +126,18 @@ type Library struct {
 	// (by byte budget, not by path).
 	decodeMu    sync.Mutex
 	decodeCache map[string]*cachedDecode
+
+	// analysisCache memoises beat-graph analyses keyed by file path.
+	// Survives across DecodeTrack calls (unlike decodeCache, which is
+	// invalidated when the MediaStore evicts the PCM). The on-disk
+	// mirror at <userConfigDir>/analysis/<sha1>.json keeps results
+	// alive across restarts, which removes the dominant cost of the
+	// first play of a previously-known track.
+	analysisMu    sync.Mutex
+	analysisMem   map[string]*cachedAnalysis
+	analysisDir   string
+	analysisInit  sync.Once
+	analysisError error
 }
 
 // cachedDecode is one entry in the Library's metadata cache. `mtime` is
@@ -127,6 +148,12 @@ type cachedDecode struct {
 	mtime int64
 }
 
+// cachedAnalysis is the in-memory mirror of an on-disk analysis JSON.
+type cachedAnalysis struct {
+	analysis audio.Analysis
+	mtime    int64
+}
+
 // New builds a Library backed by the given subsystems.
 func New(st *store.Store, ff *ffmpeg.Service, md *media.Store) *Library {
 	return &Library{
@@ -134,6 +161,7 @@ func New(st *store.Store, ff *ffmpeg.Service, md *media.Store) *Library {
 		ffmpeg:      ff,
 		media:       md,
 		decodeCache: make(map[string]*cachedDecode),
+		analysisMem: make(map[string]*cachedAnalysis),
 	}
 }
 
@@ -494,6 +522,13 @@ func (l *Library) DecodeTrack(path string) (DecodedAudio, error) {
 			out.Album = meta.Album()
 		}
 	}
+
+	// Beat-graph analysis. We do this in Go (not the frontend) so the
+	// ~500-1500ms beat-detection pass doesn't compete with the React
+	// render loop on track switches. Disk-cached per (path, mtime)
+	// so subsequent plays come back instantly.
+	out.Analysis = l.resolveAnalysis(path, mtime, samples, sr, ch, duration, out.Title)
+
 	logf("done path=%q duration=%.2fs frames=%d pcm=%d bytes url=%s took=%s",
 		path, duration, frames, len(pcmBytes), mediaURL, time.Since(start))
 
@@ -504,6 +539,139 @@ func (l *Library) DecodeTrack(path string) (DecodedAudio, error) {
 	l.decodeMu.Unlock()
 
 	return out, nil
+}
+
+// resolveAnalysis returns a beat graph for `path`, hitting the
+// in-memory cache → on-disk cache → fresh-compute paths in that
+// order. `samples` is the int16 PCM we already have in memory; we
+// only run the analysis pass if neither cache layer can serve us.
+//
+// `displayTitle` lets us label the analysis without waiting for the
+// caller to do their own tag re-read; the value is stored on disk so
+// the title shown in now-playing is consistent across launches.
+func (l *Library) resolveAnalysis(path string, mtime int64, samples []int16, sr, ch int, duration float64, displayTitle string) *audio.Analysis {
+	// In-memory cache first — if we already analysed this exact file
+	// in the current session, skip everything.
+	l.analysisMu.Lock()
+	if cached, ok := l.analysisMem[path]; ok && cached.mtime == mtime {
+		a := cached.analysis
+		l.analysisMu.Unlock()
+		return &a
+	}
+	l.analysisMu.Unlock()
+
+	// Disk cache: per-track JSON files keyed by sha1(path) + mtime.
+	if cached, ok := l.loadCachedAnalysis(path, mtime); ok {
+		l.analysisMu.Lock()
+		l.analysisMem[path] = &cachedAnalysis{analysis: cached, mtime: mtime}
+		l.analysisMu.Unlock()
+		return &cached
+	}
+
+	// Cold path — actually run the analysis.
+	if l.ctx != nil {
+		wruntime.LogInfof(l.ctx, "[analyze] computing path=%q duration=%.2fs", path, duration)
+	}
+	t0 := time.Now()
+	a := audio.AnalyzeInt16(samples, ch, sr, duration, displayTitle)
+	if l.ctx != nil {
+		wruntime.LogInfof(l.ctx, "[analyze] done path=%q beats=%d edges=%d took=%s",
+			path, a.NBeats, len(a.Edges), time.Since(t0))
+	}
+
+	l.analysisMu.Lock()
+	l.analysisMem[path] = &cachedAnalysis{analysis: a, mtime: mtime}
+	l.analysisMu.Unlock()
+	l.saveCachedAnalysis(path, mtime, a)
+	return &a
+}
+
+// ensureAnalysisDir lazily resolves and creates the on-disk cache
+// directory. Returns the empty string if the cache can't be set up
+// (no app-data dir, permissions issue, …); callers should treat that
+// as "no disk cache" rather than fail outright.
+func (l *Library) ensureAnalysisDir() string {
+	l.analysisInit.Do(func() {
+		base, err := store.UserConfigDir("Accidia")
+		if err != nil {
+			l.analysisError = err
+			return
+		}
+		dir := filepath.Join(base, "analysis")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			l.analysisError = err
+			return
+		}
+		l.analysisDir = dir
+	})
+	return l.analysisDir
+}
+
+// analysisFilePath builds the on-disk JSON path for a given track.
+// We sha1 the absolute path so funky filenames + collisions stay
+// safe, then pick a 16-char prefix — plenty for ten-thousand-track
+// libraries.
+func (l *Library) analysisFilePath(path string) string {
+	dir := l.ensureAnalysisDir()
+	if dir == "" {
+		return ""
+	}
+	sum := sha1.Sum([]byte(path))
+	return filepath.Join(dir, hex.EncodeToString(sum[:])[:16]+".json")
+}
+
+// diskAnalysis is the on-disk envelope: we store the raw analysis
+// alongside the source mtime so a stale entry can be detected
+// without re-stat-ing every dependency. The path is duplicated in
+// for human-readable debugging.
+type diskAnalysis struct {
+	Path     string         `json:"path"`
+	MTime    int64          `json:"mtime"`
+	Analysis audio.Analysis `json:"analysis"`
+}
+
+func (l *Library) loadCachedAnalysis(path string, mtime int64) (audio.Analysis, bool) {
+	fp := l.analysisFilePath(path)
+	if fp == "" {
+		return audio.Analysis{}, false
+	}
+	data, err := os.ReadFile(fp)
+	if err != nil {
+		return audio.Analysis{}, false
+	}
+	var d diskAnalysis
+	if err := json.Unmarshal(data, &d); err != nil {
+		// Corrupt cache entry — drop it on the floor; next run will
+		// rewrite a clean file.
+		return audio.Analysis{}, false
+	}
+	if d.MTime != mtime {
+		return audio.Analysis{}, false
+	}
+	if d.Analysis.NBeats == 0 || len(d.Analysis.Beats) == 0 {
+		// Sentinel for "we tried but the file had nothing rhythmic".
+		// We still treat it as a valid cache hit so we don't keep
+		// wasting cycles re-confirming the same negative result.
+		return d.Analysis, true
+	}
+	return d.Analysis, true
+}
+
+func (l *Library) saveCachedAnalysis(path string, mtime int64, a audio.Analysis) {
+	fp := l.analysisFilePath(path)
+	if fp == "" {
+		return
+	}
+	d := diskAnalysis{Path: path, MTime: mtime, Analysis: a}
+	data, err := json.Marshal(d)
+	if err != nil {
+		return
+	}
+	tmp := fp + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, fp)
 }
 
 // contextOrBackground returns the attached Wails context, falling back to

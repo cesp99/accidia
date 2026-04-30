@@ -19,8 +19,21 @@ type Settings struct {
 	JumpProbability float64 `json:"jumpProbability"`
 	JumpCooldown    float64 `json:"jumpCooldown"`
 	LastTrackPath   string  `json:"lastTrackPath,omitempty"`
-	WindowWidth     int     `json:"windowWidth,omitempty"`
-	WindowHeight    int     `json:"windowHeight,omitempty"`
+	// Window geometry. Zero values mean "no preference" and the OS /
+	// window manager picks a sensible default. We persist these
+	// alongside the other settings so the app reopens where the user
+	// last left it instead of flashing into a random screen position.
+	WindowWidth  int `json:"windowWidth,omitempty"`
+	WindowHeight int `json:"windowHeight,omitempty"`
+	WindowX      int `json:"windowX,omitempty"`
+	WindowY      int `json:"windowY,omitempty"`
+	// HasWindowPos is set by Go once a real window position has been
+	// captured. Lets us tell apart "user never moved the window"
+	// (no preference, let the WM center) from "user moved it to
+	// (0, 0)" (legitimate position). Without this flag every fresh
+	// install would snap to the upper-left corner because the zero
+	// values would look like real coordinates.
+	HasWindowPos bool `json:"hasWindowPos,omitempty"`
 	// BackdropOpacity controls how opaque the app's backdrop (the dark
 	// base layer underneath the blurred album art) is. 1.0 = fully
 	// opaque (no desktop bleed-through); lower values let the host

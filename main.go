@@ -23,15 +23,20 @@ func main() {
 	app := NewApp()
 
 	err := wails.Run(&options.App{
-		Title:             "Accidia",
-		Width:             1280,
-		Height:            820,
-		MinWidth:          900,
-		MinHeight:         600,
-		DisableResize:     false,
-		Fullscreen:        false,
-		Frameless:         true,
-		StartHidden:       false,
+		Title:         "Accidia",
+		Width:         1280,
+		Height:        820,
+		MinWidth:      900,
+		MinHeight:     600,
+		DisableResize: false,
+		Fullscreen:    false,
+		Frameless:     true,
+		// Start hidden so we can restore the saved window geometry +
+		// the user's backdrop opacity *before* the OS paints anything.
+		// The frontend calls `ShowWindow()` once it has applied the
+		// persisted settings, which gives us an in-place reveal with
+		// no random-position / wrong-opacity flash on launch.
+		StartHidden:       true,
 		HideWindowOnClose: false,
 		// Make the underlying window background fully transparent so platform
 		// vibrancy / mica / GTK alpha can show through. The visible UI is

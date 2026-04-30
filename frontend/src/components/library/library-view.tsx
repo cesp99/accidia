@@ -79,6 +79,15 @@ interface LibraryViewProps {
   onCreatePlaylistWithTracks: (paths: string[]) => void;
   /** Hoisted so parent components can join against favorites / playlists. */
   onLibraryLoad?: (library: store.LibraryScanResult) => void;
+  /**
+   * Precomputed album/artist groupings owned by the parent (App.tsx).
+   * Memoised against a stable libraryTracks reference so they only
+   * change on rescan or folder swap — switching between "all" /
+   * "albums" / "artists" reuses the same buckets, eliminating the
+   * per-tab `groupBy` cost on big libraries.
+   */
+  albumGroups?: AlbumGroup[];
+  artistGroups?: ArtistGroup[];
 }
 
 interface ScanProgress {
@@ -99,6 +108,8 @@ export function LibraryView({
   onAddToPlaylist,
   onCreatePlaylistWithTracks,
   onLibraryLoad,
+  albumGroups,
+  artistGroups,
 }: LibraryViewProps) {
   const [library, setLibrary] = useState<store.LibraryScanResult | null>(null);
   const [scanning, setScanning] = useState(false);
@@ -170,20 +181,33 @@ export function LibraryView({
 
   const tracks = library?.tracks ?? [];
 
-  // Resolve the drilled-down bucket from the full track list. Computed
+  // Prefer the parent's pre-memoised groupings when they line up with
+  // our local library state (i.e. the parent already saw our latest
+  // onLibraryLoad). Falling back to a local `groupByAlbum`/`groupByArtist`
+  // pass keeps this component usable in isolation.
+  const effectiveAlbumGroups = useMemo<AlbumGroup[]>(() => {
+    if (albumGroups && albumGroups.length > 0) return albumGroups;
+    if (tracks.length === 0) return [];
+    return groupByAlbum(tracks);
+  }, [albumGroups, tracks]);
+  const effectiveArtistGroups = useMemo<ArtistGroup[]>(() => {
+    if (artistGroups && artistGroups.length > 0) return artistGroups;
+    if (tracks.length === 0) return [];
+    return groupByArtist(tracks);
+  }, [artistGroups, tracks]);
+
+  // Resolve the drilled-down bucket from the full group list. Computed
   // unconditionally (rules-of-hooks) — returns null when no drill is
   // active or when the library hasn't been loaded yet.
   const drilledAlbum = useMemo<AlbumGroup | null>(() => {
-    if (drill?.type !== "album" || tracks.length === 0) return null;
-    const all = groupByAlbum(tracks);
-    return all.find((g) => g.key === drill.key) ?? null;
-  }, [drill, tracks]);
+    if (drill?.type !== "album" || effectiveAlbumGroups.length === 0) return null;
+    return effectiveAlbumGroups.find((g) => g.key === drill.key) ?? null;
+  }, [drill, effectiveAlbumGroups]);
 
   const drilledArtist = useMemo<ArtistGroup | null>(() => {
-    if (drill?.type !== "artist" || tracks.length === 0) return null;
-    const all = groupByArtist(tracks);
-    return all.find((g) => g.name === drill.name) ?? null;
-  }, [drill, tracks]);
+    if (drill?.type !== "artist" || effectiveArtistGroups.length === 0) return null;
+    return effectiveArtistGroups.find((g) => g.name === drill.name) ?? null;
+  }, [drill, effectiveArtistGroups]);
 
   if (!library || tracks.length === 0) {
     return (
@@ -255,6 +279,7 @@ export function LibraryView({
       return (
         <AlbumsGrid
           tracks={tracks}
+          groups={effectiveAlbumGroups}
           onSelect={(g) => setDrill({ type: "album", key: g.key })}
           onPlay={(g) => onPlay(g.tracks[0], g.tracks, `${g.album} · ${g.artist}`)}
           onShuffle={(g) => onShufflePlay(g.tracks, `${g.album} · ${g.artist}`)}
@@ -265,6 +290,7 @@ export function LibraryView({
       return (
         <ArtistsList
           tracks={tracks}
+          groups={effectiveArtistGroups}
           onSelect={(g) => setDrill({ type: "artist", name: g.name })}
           onPlay={(g) => onPlay(g.tracks[0], g.tracks, `Artist: ${g.name}`)}
           onShuffle={(g) => onShufflePlay(g.tracks, `Artist: ${g.name}`)}
@@ -276,6 +302,7 @@ export function LibraryView({
       <TrackList
         heading="Library"
         tracks={tracks}
+        groups={effectiveAlbumGroups}
         currentPath={currentPath}
         onPlay={onPlay}
         headerActions={

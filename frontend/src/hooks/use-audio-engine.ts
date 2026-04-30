@@ -322,6 +322,14 @@ export function useAudioEngine() {
       // We're loading a new track — tear down any in-flight source from
       // the previous one and reset the playback cursor so the next
       // play()/playFrom() call starts from the top.
+      //
+      // CRITICAL: reset isPlaying to false here. After a track naturally
+      // ends in advance-mode (queue advance), the rAF loop keeps the
+      // "isPlaying" flag at true while it spins waiting for the caller
+      // to swap the buffer. Without this reset, the upcoming play() call
+      // would early-return on its idempotent guard and the new track
+      // would be loaded but silent — exactly the "next song shows but
+      // doesn't start" symptom users see when stepping through a queue.
       stopCurrentSource(false);
       cancelAnimationFrame(animFrameRef.current);
       startOffsetRef.current = 0;
@@ -329,6 +337,7 @@ export function useAudioEngine() {
       lastLoopContextTimeRef.current = null;
       trackEndFiredRef.current = false;
       updateState({
+        isPlaying: false,
         currentBeat: 0,
         currentTime: 0,
         playedSeconds: 0,

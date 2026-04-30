@@ -3,7 +3,14 @@ import { Slider } from "@/components/ui/slider";
 import { BrowserOpenURL } from "../../../wailsjs/runtime/runtime";
 
 interface SettingsViewProps {
-  backdropOpacity: number;
+  /**
+   * Persisted backdrop opacity. `null` while settings are still
+   * loading from disk — we render the slider at the default until
+   * the real value lands. The Settings tab is gated behind the
+   * normal user flow so this is rarely seen in practice, but we
+   * keep the type honest so consumers don't have to coerce.
+   */
+  backdropOpacity: number | null;
   onBackdropOpacityChange: (value: number) => void;
   /** App version, pulled from the Go `HostInfo()` binding. */
   version?: string;
@@ -19,7 +26,8 @@ export function SettingsView({
   onBackdropOpacityChange,
   version,
 }: SettingsViewProps) {
-  const pct = Math.round(backdropOpacity * 100);
+  const value = backdropOpacity ?? 1;
+  const pct = Math.round(value * 100);
 
   return (
     <div className="h-full overflow-y-auto scroll-thin px-8 py-6">
@@ -57,7 +65,7 @@ export function SettingsView({
                   min={0.1}
                   max={1}
                   step={0.01}
-                  value={[backdropOpacity]}
+                  value={[value]}
                   onValueChange={([v]) => onBackdropOpacityChange(v)}
                   className="[&_[data-slot=slider-range]]:bg-white [&_[data-slot=slider-thumb]]:border-white [&_[data-slot=slider-thumb]]:bg-white"
                   aria-label="Backdrop opacity"

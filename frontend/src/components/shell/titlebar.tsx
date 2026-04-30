@@ -13,9 +13,7 @@ interface TitleBarProps {
 }
 
 /**
- * Minimal titlebar — just the drag region plus window controls.
- * No app name is rendered here; the OS window title is the one and only
- * place the product name appears in the chrome.
+ * Minimal titlebar with app name + window controls.
  */
 export function TitleBar({ platform }: TitleBarProps) {
   const [isMax, setIsMax] = useState(false);
@@ -43,6 +41,12 @@ export function TitleBar({ platform }: TitleBarProps) {
     >
       {/* macOS: reserve the 78px slot for system traffic lights. */}
       {isMac && <div className="w-[78px] shrink-0" />}
+
+      <div className="pointer-events-none absolute inset-x-0 flex h-full items-center justify-center">
+        <span className="truncate px-3 text-[11px] font-semibold tracking-[0.12em] text-foreground/80">
+          Accidia
+        </span>
+      </div>
 
       {/* Keep a flexible spacer so the Win/Linux buttons stay on the right. */}
       <div className="flex-1" />

@@ -43,7 +43,18 @@ export function QueueDrawer({
     <aside
       className={cn(
         "absolute right-0 top-0 bottom-0 z-30 flex w-[340px] flex-col",
-        "border-l border-white/6 glass-strong",
+        // A strongly opaque dark panel (not the lighter `glass-strong`)
+        // because the queue overlays the Now Playing pane — Jump
+        // Engine labels and sliders sit directly underneath. The old
+        // 5%-white-on-blur was too transparent and the labels bled
+        // through on top of the queue list. We still keep a backdrop
+        // blur so users running a low backdrop-opacity setting still
+        // get the wallpaper hint at the panel edges, but the dark
+        // base is opaque enough that the app content under the panel
+        // is fully hidden.
+        "border-l border-white/10",
+        "bg-[oklch(0.10_0.004_240)]/95 backdrop-blur-2xl backdrop-saturate-150",
+        "shadow-[-12px_0_40px_-12px_rgba(0,0,0,0.55)]",
       )}
       aria-label="Play queue"
     >
