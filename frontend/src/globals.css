@@ -1,0 +1,214 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+  Accidia — minimalist dark palette.
+  We lean almost monochrome: a single neutral-grey base with just enough
+  hue to feel warm, plus a restrained cyan accent reserved for the
+  currently-playing / interactive states. No gradients, no flashy brand
+  blobs, no multi-hue chart palette.
+*/
+:root {
+  --background: oklch(0.09 0.004 240);
+  --foreground: oklch(0.97 0.003 240);
+
+  --card: oklch(0.14 0.004 240);
+  --card-foreground: oklch(0.97 0.003 240);
+  --surface: oklch(0.17 0.004 240);
+
+  --popover: oklch(0.12 0.004 240);
+  --popover-foreground: oklch(0.97 0.003 240);
+
+  /* Single accent — used sparingly for active UI state. */
+  --primary: oklch(0.84 0.14 210);
+  --primary-foreground: oklch(0.09 0.004 240);
+
+  /* Warm accent for jump flashes only. */
+  --accent: oklch(0.80 0.14 75);
+  --accent-foreground: oklch(0.09 0.004 240);
+
+  --secondary: oklch(0.20 0.004 240);
+  --secondary-foreground: oklch(0.90 0.003 240);
+
+  --muted: oklch(0.20 0.004 240);
+  --muted-foreground: oklch(0.62 0.004 240);
+
+  --destructive: oklch(0.60 0.19 24);
+  --destructive-foreground: oklch(0.98 0 0);
+
+  --border: oklch(0.24 0.004 240);
+  --input: oklch(0.20 0.004 240);
+  --ring: oklch(0.84 0.14 210);
+
+  --radius: 0.75rem;
+}
+
+.dark {
+  --background: oklch(0.09 0.004 240);
+  --foreground: oklch(0.97 0.003 240);
+  --card: oklch(0.14 0.004 240);
+  --card-foreground: oklch(0.97 0.003 240);
+  --surface: oklch(0.17 0.004 240);
+  --popover: oklch(0.12 0.004 240);
+  --popover-foreground: oklch(0.97 0.003 240);
+  --primary: oklch(0.84 0.14 210);
+  --primary-foreground: oklch(0.09 0.004 240);
+  --accent: oklch(0.80 0.14 75);
+  --accent-foreground: oklch(0.09 0.004 240);
+  --secondary: oklch(0.20 0.004 240);
+  --secondary-foreground: oklch(0.90 0.003 240);
+  --muted: oklch(0.20 0.004 240);
+  --muted-foreground: oklch(0.62 0.004 240);
+  --destructive: oklch(0.60 0.19 24);
+  --destructive-foreground: oklch(0.98 0 0);
+  --border: oklch(0.24 0.004 240);
+  --input: oklch(0.20 0.004 240);
+  --ring: oklch(0.84 0.14 210);
+}
+
+@theme inline {
+  --font-sans: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'Space Mono', 'SF Mono', ui-monospace, monospace;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-surface: var(--surface);
+}
+
+/* === Wails / desktop transparency ===
+   html, body, #root are fully transparent so the native window alpha
+   shines through. The visible backdrop is painted by <BlurBackground />
+   inside React. */
+html,
+body,
+#root {
+  background: transparent;
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color: var(--foreground);
+  user-select: none;
+  letter-spacing: -0.01em;
+}
+
+button,
+input,
+[contenteditable] {
+  user-select: auto;
+}
+
+/* Region for dragging the window via the custom titlebar */
+[data-wails-drag] {
+  --wails-draggable: drag;
+  -webkit-app-region: drag;
+}
+[data-wails-drag] button,
+[data-wails-drag] input,
+[data-wails-no-drag] {
+  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    color: var(--foreground);
+  }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in {
+  animation: fade-in 0.4s cubic-bezier(0.32, 0.72, 0, 1) forwards;
+}
+
+@keyframes slow-pan {
+  0%   { transform: translate3d(-2%, -2%, 0) scale(1.08); }
+  50%  { transform: translate3d(2%, 2%, 0) scale(1.13); }
+  100% { transform: translate3d(-2%, -2%, 0) scale(1.08); }
+}
+.animate-slow-pan {
+  animation: slow-pan 34s ease-in-out infinite;
+}
+
+/*
+  Glass utility — a thin translucent surface with blur. Used for every
+  panel, card and bar in the UI. Stays flat, no gradients, no inner
+  shadows.
+*/
+.glass {
+  background: rgba(255, 255, 255, 0.035);
+  backdrop-filter: blur(32px) saturate(140%);
+  -webkit-backdrop-filter: blur(32px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+.glass-strong {
+  background: rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(44px) saturate(160%);
+  -webkit-backdrop-filter: blur(44px) saturate(160%);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* Custom scrollbar — barely visible, thin, on hover only. */
+.scroll-thin {
+  scrollbar-color: rgba(255, 255, 255, 0.08) transparent;
+  scrollbar-width: thin;
+}
+.scroll-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.scroll-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 999px;
+}
+.scroll-thin:hover::-webkit-scrollbar-thumb,
+.scroll-thin:focus-within::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* Focus rings — consistent everywhere. */
+@layer base {
+  button:focus-visible,
+  a:focus-visible,
+  [role="button"]:focus-visible,
+  input:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+    border-radius: inherit;
+  }
+}

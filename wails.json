@@ -1,0 +1,21 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "accidia",
+  "outputfilename": "accidia",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "wailsjsdir": "./frontend",
+  "version": "2",
+  "info": {
+    "companyName": "Eyed",
+    "productName": "Accidia",
+    "productVersion": "0.1.0",
+    "copyright": "Copyright © 2025 Eyed, Carlo Esposito",
+    "comments": "A native music player with the Infinite Jukebox loop engine, a studio effects rack, and time-synced lyrics."
+  },
+  "author": {
+    "name": "Eyed, Carlo Esposito"
+  }
+}
