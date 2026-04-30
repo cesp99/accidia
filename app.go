@@ -3,7 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
 
 	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -13,6 +17,7 @@ import (
 	"github.com/cesp99/infinite-jukebox/internal/library"
 	"github.com/cesp99/infinite-jukebox/internal/lyrics"
 	"github.com/cesp99/infinite-jukebox/internal/media"
+	"github.com/cesp99/infinite-jukebox/internal/mpris"
 	"github.com/cesp99/infinite-jukebox/internal/store"
 )
 
@@ -33,6 +38,16 @@ type App struct {
 	ffmpeg     *ffmpeg.Service
 	media      *media.Store
 	collection *collection.Store
+	mpris      mpris.Controller
+
+	// Cached cover-art data URLs -> on-disk file paths, so MPRIS gets a
+	// stable `file://` URL it can resolve instead of a multi-megabyte
+	// data URL (which most MPRIS clients reject and which can push a
+	// single D-Bus property-set over the bus's message-size limit,
+	// silently dropping the entire metadata push).
+	artCacheMu  sync.Mutex
+	artCacheDir string
+	artCache    map[string]string // sha1(dataURL prefix) -> absolute file path
 }
 
 // HostInfo is the small payload describing the host we're running on.
@@ -55,14 +70,41 @@ func NewApp() *App {
 	// the queue doesn't force a re-decode.
 	md := media.New(8)
 	col := collection.New()
-	return &App{
+	app := &App{
 		library:    library.New(st, ff, md),
 		store:      st,
 		lyrics:     lyrics.NewService(),
 		ffmpeg:     ff,
 		media:      md,
 		collection: col,
+		artCache:   map[string]string{},
 	}
+	// MPRIS needs access to the Wails event bus to forward desktop
+	// control commands to the frontend. We assemble the Handlers now
+	// (capturing `app` so the closures can reach `a.ctx`) but the
+	// controller itself doesn't start until startup().
+	app.mpris = mpris.New("Accidia", mpris.Handlers{
+		OnPlay:        func() { app.emitMPRIS("play") },
+		OnPause:       func() { app.emitMPRIS("pause") },
+		OnPlayPause:   func() { app.emitMPRIS("playpause") },
+		OnStop:        func() { app.emitMPRIS("stop") },
+		OnNext:        func() { app.emitMPRIS("next") },
+		OnPrevious:    func() { app.emitMPRIS("previous") },
+		OnSeek:        func(offset float64) { app.emitMPRIS("seek", offset) },
+		OnSetPosition: func(position float64) { app.emitMPRIS("setposition", position) },
+	})
+	return app
+}
+
+// emitMPRIS forwards a desktop media command to the frontend. Called
+// from D-Bus method handlers that may run on background goroutines —
+// runtime.EventsEmit is goroutine-safe so the dispatch is fine.
+func (a *App) emitMPRIS(event string, args ...any) {
+	if a.ctx == nil {
+		return
+	}
+	wruntime.LogInfof(a.ctx, "mpris: command received: %s", event)
+	wruntime.EventsEmit(a.ctx, "mpris:"+event, args...)
 }
 
 // Media returns the underlying MediaStore so main.go can wire it into the
@@ -81,6 +123,13 @@ func (a *App) startup(ctx context.Context) {
 	if err := a.collection.Init(); err != nil {
 		wruntime.LogErrorf(ctx, "collection init: %v", err)
 	}
+	if err := a.mpris.Start(); err != nil {
+		// Non-fatal — the app still works without desktop media
+		// integration, just without media-key support on Linux.
+		wruntime.LogWarningf(ctx, "mpris: %v (media keys won't control this app)", err)
+	} else if a.mpris.Running() {
+		wruntime.LogInfo(ctx, "mpris: registered on org.mpris.MediaPlayer2.accidia")
+	}
 	a.library.AttachContext(ctx)
 }
 
@@ -98,6 +147,7 @@ func (a *App) beforeClose(ctx context.Context) bool {
 
 // shutdown runs after the window has closed, before the process exits.
 func (a *App) shutdown(ctx context.Context) {
+	a.mpris.Stop()
 	if err := a.store.Flush(); err != nil {
 		wruntime.LogErrorf(ctx, "store flush: %v", err)
 	}
@@ -133,7 +183,7 @@ func (a *App) GetHostInfo() HostInfo {
 	return HostInfo{
 		Platform: runtime.GOOS,
 		Arch:     runtime.GOARCH,
-		Version:  "0.1.0",
+		Version:  Version,
 	}
 }
 
@@ -328,4 +378,135 @@ func (a *App) ReorderPlaylist(id string, paths []string) (collection.Playlist, e
 // warm and the UI transition is effectively instant.
 func (a *App) PrefetchTrack(path string) (library.DecodedAudio, error) {
 	return a.library.DecodeTrack(path)
+}
+
+// -----------------------------------------------------------------------
+// MPRIS bridge — lets the frontend push now-playing state to Linux's
+// desktop media integration. No-op on macOS/Windows where the browser's
+// MediaSession API already bridges to SMTC / Now Playing. Calling the
+// Update methods on any platform is cheap and safe; we treat the
+// off-platform case as "controller is always a stub".
+// -----------------------------------------------------------------------
+
+// MprisUpdateMetadata tells the system media widget what's now playing.
+// `duration` is in seconds. `artURL` may be a data URL, a file:// URL,
+// an http(s):// URL, or empty. Data URLs get cached to disk and
+// replaced with a file:// URL because (a) most MPRIS clients only
+// understand resolvable URLs, and (b) stuffing a multi-MB base64 blob
+// into the Metadata property can exceed the D-Bus message-size cap
+// and cause the whole property-set to be dropped — which is what was
+// leaving the system widget empty even though the app was playing.
+func (a *App) MprisUpdateMetadata(title, artist, album, artURL, trackPath string, duration float64) {
+	resolvedArt := a.resolveArtURL(artURL, trackPath)
+	if a.ctx != nil {
+		wruntime.LogInfof(a.ctx, "mpris: metadata title=%q artist=%q album=%q dur=%.1fs art=%s",
+			title, artist, album, duration, shortArt(resolvedArt))
+	}
+	a.mpris.UpdateMetadata(mpris.Metadata{
+		Title:     title,
+		Artist:    artist,
+		Album:     album,
+		ArtURL:    resolvedArt,
+		LengthSec: duration,
+		TrackPath: trackPath,
+	})
+}
+
+// resolveArtURL turns whatever the frontend passed into an artURL MPRIS
+// can work with. Returns "" to mean "no art" — the MPRIS package omits
+// the field entirely in that case.
+func (a *App) resolveArtURL(artURL, trackPath string) string {
+	if artURL == "" {
+		return ""
+	}
+	if strings.HasPrefix(artURL, "file://") ||
+		strings.HasPrefix(artURL, "http://") ||
+		strings.HasPrefix(artURL, "https://") {
+		return artURL
+	}
+	if !strings.HasPrefix(artURL, "data:") {
+		// Unknown scheme; safer to skip than to break the metadata.
+		return ""
+	}
+	key := mpris.ArtCacheKey(trackPath, artURL)
+
+	a.artCacheMu.Lock()
+	if p, ok := a.artCache[key]; ok {
+		a.artCacheMu.Unlock()
+		// Double-check the file is still around — a restart deletes the
+		// cache dir, and a stale map entry would hand MPRIS a file:// URL
+		// it can't resolve.
+		if _, err := os.Stat(p); err == nil {
+			return "file://" + p
+		}
+		// File's gone; fall through to rewrite.
+		a.artCacheMu.Lock()
+		delete(a.artCache, key)
+	}
+	dir := a.artCacheDir
+	a.artCacheMu.Unlock()
+
+	if dir == "" {
+		d, err := store.UserConfigDir("Accidia")
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(d, "mpris-art")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return ""
+		}
+		a.artCacheMu.Lock()
+		a.artCacheDir = dir
+		a.artCacheMu.Unlock()
+	}
+
+	filePath, ok := mpris.WriteDataURLToCache(artURL, dir, key)
+	if !ok {
+		return ""
+	}
+	a.artCacheMu.Lock()
+	a.artCache[key] = filePath
+	a.artCacheMu.Unlock()
+	return "file://" + filePath
+}
+
+// shortArt truncates URLs so debug logs don't contain megabytes of base64.
+func shortArt(u string) string {
+	if len(u) <= 80 {
+		return u
+	}
+	return u[:77] + "..."
+}
+
+// MprisUpdatePlaybackStatus accepts one of "Playing", "Paused", "Stopped".
+// Any other value is treated as "Stopped".
+func (a *App) MprisUpdatePlaybackStatus(status string) {
+	var s mpris.PlaybackStatus
+	switch status {
+	case "Playing":
+		s = mpris.StatusPlaying
+	case "Paused":
+		s = mpris.StatusPaused
+	default:
+		s = mpris.StatusStopped
+	}
+	if a.ctx != nil {
+		wruntime.LogInfof(a.ctx, "mpris: status %s", s)
+	}
+	a.mpris.UpdatePlaybackStatus(s)
+}
+
+// MprisUpdatePosition syncs the scrubber position in the desktop
+// widget. `position` is in seconds.
+func (a *App) MprisUpdatePosition(position float64) {
+	a.mpris.UpdatePosition(position)
+}
+
+// MprisUpdateCapabilities lets the frontend report whether Next/Prev
+// are enabled right now (empty queue disables them, for example). The
+// desktop widget greys out the corresponding buttons when these are
+// false.
+func (a *App) MprisUpdateCapabilities(canNext, canPrevious bool) {
+	a.mpris.UpdateCanGoNext(canNext)
+	a.mpris.UpdateCanGoPrevious(canPrevious)
 }

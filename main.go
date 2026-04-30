@@ -87,9 +87,12 @@ func main() {
 			WebviewIsTransparent: true,
 			WindowIsTranslucent:  true,
 			About: &mac.AboutInfo{
-				Title:   "Accidia",
-				Message: "A native music player with the Infinite Jukebox loop engine.\nBy Eyed & Carlo Esposito.",
-				Icon:    appIcon,
+				Title: "Accidia",
+				Message: "Accidia " + Version + "\n" +
+					"A native music player with the Infinite Jukebox loop engine.\n\n" +
+					"By Carlo Esposito for Eyed®.\n" +
+					"Infinite Jukebox concept by Paul Lamere (The Echo Nest, 2012).",
+				Icon: appIcon,
 			},
 		},
 		// ---------------------------------------------------------------

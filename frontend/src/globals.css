@@ -6,9 +6,16 @@
 /*
   Accidia — minimalist dark palette.
   We lean almost monochrome: a single neutral-grey base with just enough
-  hue to feel warm, plus a restrained cyan accent reserved for the
+  hue to feel warm, plus a near-white accent reserved for the
   currently-playing / interactive states. No gradients, no flashy brand
   blobs, no multi-hue chart palette.
+
+  NOTE ON --primary: conceptually this is the "accent color" for active
+  interactive states (selected nav item, favourited heart, toggle on,
+  etc). We keep it near-white on purpose — the app deliberately uses a
+  monochrome accent rather than a branded hue. The name is retained
+  because Tailwind/shadcn components reference it, and because external
+  data-viz (beat-circle canvas) still needs a reserved accent slot.
 */
 :root {
   --background: oklch(0.09 0.004 240);
@@ -21,8 +28,8 @@
   --popover: oklch(0.12 0.004 240);
   --popover-foreground: oklch(0.97 0.003 240);
 
-  /* Single accent — used sparingly for active UI state. */
-  --primary: oklch(0.84 0.14 210);
+  /* Single accent — near-white. Used sparingly for active UI state. */
+  --primary: oklch(0.97 0.003 240);
   --primary-foreground: oklch(0.09 0.004 240);
 
   /* Warm accent for jump flashes only. */
@@ -40,7 +47,7 @@
 
   --border: oklch(0.24 0.004 240);
   --input: oklch(0.20 0.004 240);
-  --ring: oklch(0.84 0.14 210);
+  --ring: oklch(0.97 0.003 240);
 
   --radius: 0.75rem;
 }
@@ -53,7 +60,7 @@
   --surface: oklch(0.17 0.004 240);
   --popover: oklch(0.12 0.004 240);
   --popover-foreground: oklch(0.97 0.003 240);
-  --primary: oklch(0.84 0.14 210);
+  --primary: oklch(0.97 0.003 240);
   --primary-foreground: oklch(0.09 0.004 240);
   --accent: oklch(0.80 0.14 75);
   --accent-foreground: oklch(0.09 0.004 240);
@@ -65,7 +72,7 @@
   --destructive-foreground: oklch(0.98 0 0);
   --border: oklch(0.24 0.004 240);
   --input: oklch(0.20 0.004 240);
-  --ring: oklch(0.84 0.14 210);
+  --ring: oklch(0.97 0.003 240);
 }
 
 @theme inline {

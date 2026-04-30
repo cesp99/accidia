@@ -8,6 +8,7 @@ import { LyricsView } from "@/components/shell/lyrics-view";
 import { LibraryView } from "@/components/library/library-view";
 import { FavoritesView, PlaylistView, PlaylistPrompt } from "@/components/library/collection-views";
 import { QueueDrawer } from "@/components/shell/queue-drawer";
+import { SettingsView } from "@/components/shell/settings-view";
 import { EffectsPanel } from "@/components/jukebox/effects-panel";
 import { FFmpegDialog } from "@/components/shell/ffmpeg-dialog";
 import { HealthBanner } from "@/components/shell/health-banner";
@@ -28,9 +29,14 @@ import {
   GetCoverArt,
   GetHostInfo,
   LoadSettings,
+  MprisUpdateCapabilities,
+  MprisUpdateMetadata,
+  MprisUpdatePlaybackStatus,
+  MprisUpdatePosition,
   PrefetchTrack,
   SaveSettings,
 } from "../wailsjs/go/main/App";
+import { EventsOn, LogError, LogInfo } from "../wailsjs/runtime/runtime";
 import type { main, store } from "../wailsjs/go/models";
 
 interface NowPlayingTrack {
@@ -46,6 +52,7 @@ interface NowPlayingTrack {
 
 export default function App() {
   const [platform, setPlatform] = useState<string>("");
+  const [appVersion, setAppVersion] = useState<string>("");
   const [view, setView] = useState<View>("library");
   const [track, setTrack] = useState<NowPlayingTrack | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
@@ -85,6 +92,8 @@ export default function App() {
     setJumpSettings,
     setEffectsState,
     setVolume,
+    setShouldLoop,
+    setOnTrackEnd,
     playbackState,
     getCurrentAudioTime,
   } = useAudioEngine();
@@ -102,13 +111,17 @@ export default function App() {
   });
   const [effectsState, setEffectsStateLocal] = useState<EffectsState>(defaultEffectsState);
   const [volume, setVolumeLocal] = useState(1);
+  const [backdropOpacity, setBackdropOpacity] = useState(1);
 
   const settingsLoaded = useRef(false);
 
   // Host + settings bootstrap.
   useEffect(() => {
     GetHostInfo()
-      .then((h: main.HostInfo) => setPlatform(h.platform))
+      .then((h: main.HostInfo) => {
+        setPlatform(h.platform);
+        if (h.version) setAppVersion(h.version);
+      })
       .catch(() => setPlatform("web"));
   }, []);
 
@@ -125,6 +138,9 @@ export default function App() {
             minSecondsBetweenJumps: s.jumpCooldown,
           };
           setJumpSettingsState(next);
+        }
+        if (typeof s.backdropOpacity === "number" && s.backdropOpacity > 0) {
+          setBackdropOpacity(Math.max(0, Math.min(1, s.backdropOpacity)));
         }
         settingsLoaded.current = true;
       })
@@ -152,8 +168,9 @@ export default function App() {
       lastTrackPath: track?.path ?? "",
       windowWidth: 0,
       windowHeight: 0,
+      backdropOpacity,
     } as store.Settings).catch(() => {});
-  }, [volume, jumpSettings, track?.path]);
+  }, [volume, jumpSettings, track?.path, backdropOpacity]);
 
   const handleVolume = useCallback(
     (next: number) => {
@@ -205,11 +222,56 @@ export default function App() {
   // already switched to a different track.
   const loadTokenRef = useRef(0);
 
+  // Deferred analysis input for the *current* track. Populated on load,
+  // cleared after the heavy analysis runs (or on track change). We store
+  // just what analyzeMonoPcm needs: the mono float buffer + metadata.
+  // Beat analysis on a 4-minute song is ~500-1500ms on the main thread,
+  // so we only run it when Infinite Jukebox is actually on — otherwise
+  // track switching is faster and the user never pays for a feature
+  // they don't use.
+  const pendingAnalysisRef = useRef<{
+    trackPath: string;
+    token: number;
+    mono: Float32Array;
+    sampleRate: number;
+    duration: number;
+    displayTitle: string;
+  } | null>(null);
+
+  // Runs the heavy analyzeMonoPcm pass on whatever is in
+  // pendingAnalysisRef and swaps the result into the audio engine. No-op
+  // if nothing is pending (already analysed / different track).
+  const runAnalysisNow = useCallback(() => {
+    const p = pendingAnalysisRef.current;
+    if (!p) return;
+    if (p.token !== loadTokenRef.current) {
+      pendingAnalysisRef.current = null;
+      return;
+    }
+    try {
+      const real = analyzeMonoPcm(p.mono, p.sampleRate, p.duration, p.displayTitle);
+      if (p.token !== loadTokenRef.current) return;
+      updateAnalysis(real);
+      setTrack((prev) =>
+        prev && prev.path === p.trackPath
+          ? { ...prev, analysis: { ...real, title: prev.title } }
+          : prev,
+      );
+    } catch (e) {
+      console.warn("[analyze]", e);
+    } finally {
+      // Free the mono buffer regardless — we don't re-analyze.
+      pendingAnalysisRef.current = null;
+      setAnalyzing(false);
+    }
+  }, [updateAnalysis]);
+
   const loadAndPlayTrack = useCallback(
     async (t: store.Track): Promise<boolean> => {
       setError(null);
-      setAnalyzing(true);
       const token = ++loadTokenRef.current;
+      // Invalidate any previous track's pending analysis.
+      pendingAnalysisRef.current = null;
 
       let phase: "decode" | "fetch" | "playback" | "analyze" = "decode";
       try {
@@ -262,41 +324,27 @@ export default function App() {
         setVolume(volume);
         play();
 
-        // Playback is underway. Now run the real beat analysis in the
-        // background and swap it in when ready.
+        // Park the mono + metadata for an optional later analysis. It
+        // only happens if the Infinite Jukebox is (or becomes) active —
+        // see the jukeboxActive effect below. The main-thread cost of
+        // pcmToMonoFloat32 itself is modest (O(n) single pass) so we do
+        // it now to keep the heavier analyzeMonoPcm simple.
         phase = "analyze";
-        const runRealAnalysis = () => {
-          if (token !== loadTokenRef.current) return;
-          try {
-            const mono = pcmToMonoFloat32(pcm, decoded.channels);
-            const real = analyzeMonoPcm(
-              mono,
-              decoded.sampleRate,
-              decoded.duration,
-              displayTitle,
-            );
-            if (token !== loadTokenRef.current) return;
-            updateAnalysis(real);
-            setTrack((prev) =>
-              prev && prev.path === t.path
-                ? { ...prev, analysis: { ...real, title: effectiveTitle } }
-                : prev,
-            );
-          } catch (e) {
-            console.warn("[analyze]", e);
-          } finally {
-            if (token === loadTokenRef.current) setAnalyzing(false);
-          }
+        pendingAnalysisRef.current = {
+          trackPath: t.path,
+          token,
+          mono: pcmToMonoFloat32(pcm, decoded.channels),
+          sampleRate: decoded.sampleRate,
+          duration: decoded.duration,
+          displayTitle,
         };
 
-        const scheduleAnalysis =
-          typeof (window as unknown as { requestIdleCallback?: (cb: () => void) => number })
-            .requestIdleCallback === "function"
-            ? (window as unknown as {
-                requestIdleCallback: (cb: () => void, opts?: { timeout: number }) => number;
-              }).requestIdleCallback
-            : (cb: () => void) => window.setTimeout(cb, 50);
-        scheduleAnalysis(runRealAnalysis, { timeout: 1500 } as { timeout: number });
+        if (jukeboxActive) {
+          setAnalyzing(true);
+          scheduleIdle(() => runAnalysisNow());
+        } else {
+          setAnalyzing(false);
+        }
 
         return true;
       } catch (e) {
@@ -313,15 +361,26 @@ export default function App() {
     },
     [
       loadAudio,
-      updateAnalysis,
       getContext,
       play,
       setEffectsState,
       setVolume,
       effectsState,
       volume,
+      jukeboxActive,
+      runAnalysisNow,
     ],
   );
+
+  // When the user toggles Infinite Jukebox on, analyse the *current*
+  // track if we skipped analysis at load time. This is why we held onto
+  // the mono buffer above.
+  useEffect(() => {
+    if (!jukeboxActive) return;
+    if (!pendingAnalysisRef.current) return;
+    setAnalyzing(true);
+    scheduleIdle(() => runAnalysisNow());
+  }, [jukeboxActive, runAnalysisNow]);
 
   // Prefetch the "next" track in the background so hitting Next is instant.
   // We only start the prefetch once the current track has been loaded and
@@ -355,44 +414,40 @@ export default function App() {
     loadAndPlayTrack(t);
   }, [queue.state.current, loadAndPlayTrack, track?.path]);
 
-  // Auto-advance at track end. We poll on a short interval and fire
-  // `queue.next()` a bit BEFORE the engine's internal "loop back to beat
-  // 0" threshold (which lives in runPlaybackLoop at duration - 0.1s).
-  // When jukeboxActive is on, we leave the engine to handle looping so
-  // jumps keep working; when repeat is "one" we also leave the engine
-  // alone so the loop-back at end IS the repeat behavior.
+  // Track-end handling — driven by the engine's onTrackEnd callback
+  // (single fire per track, no more polling-interval race conditions).
+  //
+  // Modes:
+  //   jukeboxActive           → engine auto-loops (jumps dominate, but
+  //                             if no jump lands at the end we loop
+  //                             rather than pause)
+  //   repeat === "one"        → engine auto-loops (single-track repeat)
+  //   otherwise               → engine fires onTrackEnd → we advance
+  //                             to queue.next() or pause if empty.
+  //
+  // We use refs for `queue.next` + `pause` so the effect body can be
+  // stable and the callback registered on the engine doesn't churn
+  // every render (useQueue returns a fresh object literal each tick).
+  const queueNextRef = useRef(queue.next);
+  const pauseRef = useRef(pause);
   useEffect(() => {
-    if (!track) return;
-    if (jukeboxActive) return;
-    if (queue.state.repeat === "one") return;
-    if (!playbackState.isPlaying) return;
-    const duration = track.analysis.duration;
-    if (!duration || duration <= 0) return;
-    let fired = false;
-    const interval = setInterval(() => {
-      if (fired) return;
-      const now = getCurrentAudioTime();
-      // Fire at least 0.6s before the engine's internal loop-back, so
-      // the queue gets to pick the next track before looping kicks in.
-      if (now >= duration - 0.6) {
-        fired = true;
-        const nxt = queue.next();
-        if (!nxt) {
-          // Nothing to go to — stop playback.
-          pause();
-        }
-      }
-    }, 120);
-    return () => clearInterval(interval);
-  }, [
-    track,
-    playbackState.isPlaying,
-    jukeboxActive,
-    queue,
-    queue.state.repeat,
-    getCurrentAudioTime,
-    pause,
-  ]);
+    queueNextRef.current = queue.next;
+    pauseRef.current = pause;
+  });
+
+  useEffect(() => {
+    const shouldLoop = jukeboxActive || queue.state.repeat === "one";
+    setShouldLoop(shouldLoop);
+    if (shouldLoop) {
+      setOnTrackEnd(null);
+    } else {
+      setOnTrackEnd(() => {
+        const nxt = queueNextRef.current();
+        if (!nxt) pauseRef.current();
+      });
+    }
+    return () => setOnTrackEnd(null);
+  }, [jukeboxActive, queue.state.repeat, setShouldLoop, setOnTrackEnd]);
 
   const handlePlayPause = useCallback(() => {
     if (!track) return;
@@ -455,6 +510,262 @@ export default function App() {
     }
     queue.prev();
   }, [queue, track, seekToTime, getCurrentAudioTime]);
+
+  // -----------------------------------------------------------------
+  // Media Session API — OS integration
+  //
+  // Publishes the current track's metadata + playback state to the host
+  // OS so:
+  //   - Keyboard media keys (play/pause/next/prev) work
+  //   - Desktop widgets (KDE panel, GNOME media indicator, Windows SMTC,
+  //     macOS Now Playing) show what's playing
+  //   - Headset / Bluetooth transport controls map to our actions
+  //
+  // WebKit2GTK bridges the Web MediaSession API to MPRIS since 2.42;
+  // Chromium (Windows/Linux) bridges to SMTC / MPRIS; Safari (macOS)
+  // bridges to Now Playing. No platform-specific code needed here.
+  // -----------------------------------------------------------------
+
+  // Stable refs so the media-session handlers see the latest actions
+  // without us having to re-register them every frame.
+  const handlePrevRef = useRef(handlePrevButton);
+  const handleNextRef = useRef(handleNextButton);
+  useEffect(() => {
+    handlePrevRef.current = handlePrevButton;
+    handleNextRef.current = handleNextButton;
+  });
+
+  // Register the action handlers once on mount — they proxy through
+  // the refs above. Unregister on unmount so stale closures don't leak.
+  useEffect(() => {
+    const ms = navigator.mediaSession;
+    if (!ms) return;
+    const register = (
+      action: MediaSessionAction,
+      handler: MediaSessionActionHandler | null,
+    ) => {
+      try {
+        ms.setActionHandler(action, handler);
+      } catch {
+        /* not all actions are supported on every platform */
+      }
+    };
+    register("play", () => play());
+    register("pause", () => pause());
+    register("previoustrack", () => handlePrevRef.current());
+    register("nexttrack", () => handleNextRef.current());
+    register("seekto", (details) => {
+      if (typeof details.seekTime === "number") seekToTime(details.seekTime);
+    });
+    register("seekbackward", (details) => {
+      const delta = details.seekOffset ?? 10;
+      seekToTime(Math.max(0, getCurrentAudioTime() - delta));
+    });
+    register("seekforward", (details) => {
+      const delta = details.seekOffset ?? 10;
+      seekToTime(getCurrentAudioTime() + delta);
+    });
+    register("stop", () => pause());
+    return () => {
+      for (const a of [
+        "play",
+        "pause",
+        "previoustrack",
+        "nexttrack",
+        "seekto",
+        "seekbackward",
+        "seekforward",
+        "stop",
+      ] as MediaSessionAction[]) {
+        register(a, null);
+      }
+    };
+  }, [play, pause, seekToTime, getCurrentAudioTime]);
+
+  // Update metadata whenever the track (or its cover) changes.
+  useEffect(() => {
+    const ms = navigator.mediaSession;
+    if (!ms) return;
+    if (!track) {
+      ms.metadata = null;
+      ms.playbackState = "none";
+      return;
+    }
+    const artwork: MediaImage[] = track.coverUrl
+      ? [
+          // Most platforms just take the first entry; we claim a big
+          // size hint so SMTC / MPRIS don't under-scale it.
+          { src: track.coverUrl, sizes: "512x512", type: "image/jpeg" },
+        ]
+      : [];
+    try {
+      ms.metadata = new MediaMetadata({
+        title: track.title,
+        artist: track.artist || "",
+        album: track.album || "",
+        artwork,
+      });
+    } catch {
+      /* very old WebKit builds may lack MediaMetadata */
+    }
+  }, [track]);
+
+  // Keep playbackState + position state in sync. setPositionState lets
+  // the OS scrub/seek through the media widget.
+  useEffect(() => {
+    const ms = navigator.mediaSession;
+    if (!ms) return;
+    ms.playbackState = playbackState.isPlaying ? "playing" : "paused";
+    const duration = track?.analysis.duration ?? 0;
+    if (duration > 0 && typeof ms.setPositionState === "function") {
+      try {
+        ms.setPositionState({
+          duration,
+          playbackRate: 1,
+          position: Math.max(0, Math.min(duration, playbackState.currentTime)),
+        });
+      } catch {
+        /* some WebViews throw on rapid updates — non-fatal */
+      }
+    }
+  }, [playbackState.isPlaying, playbackState.currentTime, track?.analysis.duration]);
+
+  // -----------------------------------------------------------------
+  // MPRIS bridge — the real media-key handler on Linux.
+  //
+  // WebKit2GTK does not bridge the Web MediaSession API to MPRIS for
+  // Web Audio-only playback (only for HTMLMediaElement). So on Linux
+  // we publish our own MPRIS service directly from Go (see
+  // internal/mpris). The frontend's job is just to keep Go's state in
+  // sync and to route incoming desktop commands back to our handlers.
+  //
+  // On macOS / Windows the Go MPRIS controller is a stub, so these
+  // calls are cheap no-ops — the Media Session block above covers
+  // SMTC + Now Playing there.
+  // -----------------------------------------------------------------
+
+  // Push track metadata to Go whenever the song changes.
+  useEffect(() => {
+    if (!track) {
+      LogInfo("[mpris] clearing metadata (no track)");
+      MprisUpdateMetadata("", "", "", "", "", 0).catch((e) => {
+        const msg = `[mpris] metadata clear failed: ${e}`;
+        console.warn(msg);
+        LogError(msg);
+      });
+      return;
+    }
+    LogInfo(
+      `[mpris] pushing metadata title=${track.title} artist=${track.artist || ""} dur=${track.analysis.duration}`,
+    );
+    MprisUpdateMetadata(
+      track.title,
+      track.artist || "",
+      track.album || "",
+      track.coverUrl || "",
+      track.path,
+      track.analysis.duration,
+    ).catch((e) => {
+      const msg = `[mpris] metadata push failed: ${e}`;
+      console.warn(msg);
+      LogError(msg);
+    });
+  }, [track]);
+
+  // Push playback status.
+  useEffect(() => {
+    const status = !track ? "Stopped" : playbackState.isPlaying ? "Playing" : "Paused";
+    LogInfo(`[mpris] pushing status=${status}`);
+    MprisUpdatePlaybackStatus(status).catch((e) => {
+      const msg = `[mpris] playback status push failed: ${e}`;
+      console.warn(msg);
+      LogError(msg);
+    });
+  }, [track, playbackState.isPlaying]);
+
+  // Push scrubber position. playbackState.currentTime updates at ~60 Hz
+  // which would be very chatty over D-Bus; throttle to ~2 Hz since the
+  // desktop widget polls at ~1 Hz anyway.
+  const lastMprisPosPushRef = useRef(0);
+  useEffect(() => {
+    const now = Date.now();
+    if (now - lastMprisPosPushRef.current < 500) return;
+    lastMprisPosPushRef.current = now;
+    MprisUpdatePosition(playbackState.currentTime).catch((e) =>
+      console.warn("[mpris] position push failed:", e),
+    );
+  }, [playbackState.currentTime]);
+
+  // Push navigation capabilities so the desktop widget greys out
+  // Previous/Next correctly when there's nothing to go to.
+  const canNext = queue.peekNext() !== null;
+  const canPrev =
+    queue.state.history.length > 0 ||
+    (!queue.state.shuffle &&
+      !!queue.state.source &&
+      queue.state.source.tracks.findIndex(
+        (t) => t.path === queue.state.current?.path,
+      ) > 0) ||
+    queue.state.repeat === "all";
+  useEffect(() => {
+    MprisUpdateCapabilities(canNext, canPrev).catch((e) =>
+      console.warn("[mpris] capabilities push failed:", e),
+    );
+  }, [canNext, canPrev]);
+
+  // Stable refs so the subscribers below see fresh values without
+  // having to re-subscribe on every render (Wails event subscriptions
+  // don't cost a lot, but re-subscribing every tick is noisy).
+  const mprisPlayRef = useRef<() => void>(() => play());
+  const mprisPauseRef = useRef<() => void>(() => pause());
+  const mprisPlayPauseRef = useRef<() => void>(() => {});
+  const mprisNextRef = useRef<() => void>(() => {});
+  const mprisPrevRef = useRef<() => void>(() => {});
+  const mprisSeekRef = useRef<(offset: number) => void>(() => {});
+  const mprisSetPositionRef = useRef<(pos: number) => void>(() => {});
+  useEffect(() => {
+    mprisPlayRef.current = () => play();
+    mprisPauseRef.current = () => pause();
+    mprisPlayPauseRef.current = () => {
+      if (playbackState.isPlaying) pause();
+      else if (track) play();
+    };
+    mprisNextRef.current = handleNextButton;
+    mprisPrevRef.current = handlePrevButton;
+    mprisSeekRef.current = (offset: number) => {
+      const next = Math.max(0, getCurrentAudioTime() + offset);
+      seekToTime(next);
+    };
+    mprisSetPositionRef.current = (pos: number) => seekToTime(Math.max(0, pos));
+  });
+
+  // Subscribe once to every mpris:* Wails event. The runtime's
+  // EventsOn returns an unsubscribe function which we return from the
+  // effect so React tears it down cleanly on unmount.
+  useEffect(() => {
+    const unsubs: Array<() => void> = [];
+    unsubs.push(EventsOn("mpris:play", () => mprisPlayRef.current()));
+    unsubs.push(EventsOn("mpris:pause", () => mprisPauseRef.current()));
+    unsubs.push(EventsOn("mpris:playpause", () => mprisPlayPauseRef.current()));
+    unsubs.push(EventsOn("mpris:stop", () => mprisPauseRef.current()));
+    unsubs.push(EventsOn("mpris:next", () => mprisNextRef.current()));
+    unsubs.push(EventsOn("mpris:previous", () => mprisPrevRef.current()));
+    unsubs.push(
+      EventsOn("mpris:seek", (...args: unknown[]) => {
+        const offset = typeof args[0] === "number" ? args[0] : 0;
+        mprisSeekRef.current(offset);
+      }),
+    );
+    unsubs.push(
+      EventsOn("mpris:setposition", (...args: unknown[]) => {
+        const pos = typeof args[0] === "number" ? args[0] : 0;
+        mprisSetPositionRef.current(pos);
+      }),
+    );
+    return () => {
+      for (const u of unsubs) u();
+    };
+  }, []);
 
   // -----------------------------------------------------------------
   // Favorites + Playlists wiring
@@ -664,20 +975,17 @@ export default function App() {
         );
       case "effects":
         return (
-          <div className="h-full overflow-y-auto scroll-thin px-10 py-6">
-            <header className="mb-5">
-              <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
-                Signal chain
-              </p>
-              <h1 className="text-2xl font-bold tracking-tight">Effects</h1>
-              <p className="mt-1 text-xs text-muted-foreground">
-                Every change is click-free, even mid-jump.
-              </p>
-            </header>
-            <div className="max-w-2xl rounded-2xl glass p-5">
-              <EffectsPanel state={effectsState} onChange={handleEffects} />
-            </div>
+          <div className="h-full overflow-y-auto scroll-thin px-8 py-6">
+            <EffectsPanel state={effectsState} onChange={handleEffects} />
           </div>
+        );
+      case "settings":
+        return (
+          <SettingsView
+            backdropOpacity={backdropOpacity}
+            onBackdropOpacityChange={setBackdropOpacity}
+            version={appVersion}
+          />
         );
       case "library":
       default:
@@ -685,6 +993,7 @@ export default function App() {
           <LibraryView
             currentPath={track?.path}
             onPlay={playTrackFromList}
+            onShufflePlay={shufflePlayTracks}
             onPlayNext={handlePlayNext}
             onAddToQueue={handleAddToQueue}
             isFavorite={favorites.isFavorite}
@@ -721,11 +1030,17 @@ export default function App() {
     handleRemoveFromCurrentPlaylist,
     libraryTracks,
     currentPlaylist,
+    backdropOpacity,
+    appVersion,
   ]);
 
   return (
     <div className="relative flex h-full min-h-0 w-full flex-col">
-      <BlurBackground coverUrl={track?.coverUrl} isPlaying={playbackState.isPlaying} />
+      <BlurBackground
+        coverUrl={track?.coverUrl}
+        isPlaying={playbackState.isPlaying}
+        backdropOpacity={backdropOpacity}
+      />
 
       <TitleBar platform={platform} />
 
@@ -856,4 +1171,20 @@ function formatError(e: unknown): string {
   if (e instanceof Error) return e.message;
   if (typeof e === "string") return e;
   return String(e);
+}
+
+/**
+ * Schedule `fn` to run when the browser is idle, with a 1.5s timeout
+ * as a safety net if the page stays busy. Falls back to setTimeout
+ * when requestIdleCallback isn't available (older WebKit builds).
+ */
+function scheduleIdle(fn: () => void) {
+  const win = window as unknown as {
+    requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+  };
+  if (typeof win.requestIdleCallback === "function") {
+    win.requestIdleCallback(fn, { timeout: 1500 });
+  } else {
+    window.setTimeout(fn, 50);
+  }
 }

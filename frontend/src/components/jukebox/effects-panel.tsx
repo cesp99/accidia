@@ -1,15 +1,5 @@
 import { useMemo } from "react";
-import {
-  SlidersHorizontal,
-  AudioLines,
-  Activity,
-  Waves,
-  Filter as FilterIcon,
-  Flame,
-  Repeat,
-  CassetteTape,
-  Sparkles,
-} from "lucide-react";
+import { SlidersHorizontal, Sparkles } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Slider } from "@/components/ui/slider";
 import { effectsPresets, type EffectsState, type CompressorMode, type PresetName } from "@/lib/audio-effects";
@@ -23,28 +13,11 @@ interface EffectCardProps {
   title: string;
   description: string;
   enabled: boolean;
-  accent: "cyan" | "amber" | "violet" | "emerald" | "rose" | "sky" | "orange";
-  icon: React.ReactNode;
   onToggle: (next: boolean) => void;
   children?: React.ReactNode;
 }
 
-const ACCENT_CLASSES: Record<EffectCardProps["accent"], string> = {
-  cyan: "bg-primary/15 text-primary border-primary/40 shadow-primary/30",
-  amber: "bg-accent/15 text-accent border-accent/40 shadow-accent/30",
-  violet:
-    "bg-[color:oklch(0.65_0.2_290)]/15 text-[color:oklch(0.72_0.2_290)] border-[color:oklch(0.72_0.2_290)]/40",
-  emerald:
-    "bg-[color:oklch(0.72_0.18_160)]/15 text-[color:oklch(0.78_0.18_160)] border-[color:oklch(0.78_0.18_160)]/40",
-  rose:
-    "bg-[color:oklch(0.72_0.2_15)]/15 text-[color:oklch(0.78_0.18_15)] border-[color:oklch(0.78_0.18_15)]/40",
-  sky:
-    "bg-[color:oklch(0.75_0.15_220)]/15 text-[color:oklch(0.82_0.16_220)] border-[color:oklch(0.82_0.16_220)]/40",
-  orange:
-    "bg-[color:oklch(0.75_0.17_55)]/15 text-[color:oklch(0.82_0.17_55)] border-[color:oklch(0.82_0.17_55)]/40",
-};
-
-function EffectCard({ title, description, enabled, accent, icon, onToggle, children }: EffectCardProps) {
+function EffectCard({ title, description, enabled, onToggle, children }: EffectCardProps) {
   return (
     <div
       className={cn(
@@ -59,33 +32,23 @@ function EffectCard({ title, description, enabled, accent, icon, onToggle, child
         onClick={() => onToggle(!enabled)}
         className="w-full flex items-center justify-between gap-3 text-left"
       >
-        <div className="flex items-center gap-3 min-w-0">
-          <div
-            className={cn(
-              "w-9 h-9 rounded-lg flex items-center justify-center border shrink-0 transition-all",
-              enabled
-                ? ACCENT_CLASSES[accent]
-                : "bg-secondary/60 text-muted-foreground border-border/30",
-            )}
-          >
-            {icon}
-          </div>
-          <div className="min-w-0">
-            <p className="text-sm font-semibold text-foreground truncate">{title}</p>
-            <p className="text-xs text-muted-foreground truncate">{description}</p>
-          </div>
+        <div className="min-w-0">
+          <p className="text-sm font-semibold text-foreground truncate">{title}</p>
+          <p className="text-xs text-muted-foreground truncate">{description}</p>
         </div>
         <span
           className={cn(
             "relative inline-flex h-5 w-9 shrink-0 rounded-full transition-colors",
-            enabled ? "bg-primary" : "bg-secondary",
+            enabled ? "bg-white" : "bg-secondary",
           )}
           aria-hidden
         >
           <span
             className={cn(
               "absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform",
-              enabled ? "translate-x-4" : "translate-x-0",
+              enabled
+                ? "translate-x-4 bg-[color:oklch(0.09_0.004_240)]"
+                : "translate-x-0",
             )}
           />
         </span>
@@ -103,7 +66,6 @@ function SliderRow({
   step,
   format,
   onChange,
-  accent = "primary",
 }: {
   label: string;
   value: number;
@@ -112,7 +74,6 @@ function SliderRow({
   step: number;
   format?: (v: number) => string;
   onChange: (v: number) => void;
-  accent?: "primary" | "accent";
 }) {
   const displayValue = format ? format(value) : value.toFixed(2);
   return (
@@ -127,11 +88,7 @@ function SliderRow({
         step={step}
         value={[value]}
         onValueChange={([v]) => onChange(v)}
-        className={cn(
-          accent === "accent"
-            ? "[&_[data-slot=slider-range]]:bg-accent [&_[data-slot=slider-thumb]]:border-accent"
-            : "[&_[data-slot=slider-range]]:bg-primary [&_[data-slot=slider-thumb]]:border-primary",
-        )}
+        className="[&_[data-slot=slider-range]]:bg-white [&_[data-slot=slider-thumb]]:border-white"
       />
     </div>
   );
@@ -198,28 +155,34 @@ export function EffectsPanel({ state, onChange }: EffectsPanelProps) {
   const presetOrder: PresetName[] = ["clean", "lofi", "club", "radio", "dreamy", "destroy"];
 
   return (
-    <div className="w-full max-w-lg mx-auto space-y-3">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <SlidersHorizontal size={13} className="text-muted-foreground" />
-          <span className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">
-            Effects
-          </span>
+    <div className="mx-auto w-full max-w-5xl space-y-6">
+      {/* Page header — owns the "Effects" title so there's no duplicate
+          heading inside the card grid. */}
+      <header className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+            Signal chain
+          </p>
+          <h1 className="text-2xl font-bold tracking-tight">Effects</h1>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Every change is click-free, even mid-jump.
+          </p>
         </div>
-        <span className="text-xs text-muted-foreground tabular-nums">
-          {activeCount} active
-        </span>
-      </div>
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <SlidersHorizontal size={13} />
+          <span className="font-mono tabular-nums">{activeCount} active</span>
+        </div>
+      </header>
 
-      {/* Preset bar */}
-      <div className="rounded-lg border border-border/40 bg-card/60 p-2 space-y-2">
-        <div className="flex items-center gap-1.5 px-1">
+      {/* Presets — horizontal pill row, full width, no nested card. */}
+      <section>
+        <div className="mb-2 flex items-center gap-1.5 px-1">
           <Sparkles size={11} className="text-primary" />
-          <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-widest">
+          <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
             Presets
           </span>
         </div>
-        <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-6">
+        <div className="flex flex-wrap gap-2">
           {presetOrder.map((key) => {
             const preset = effectsPresets[key];
             return (
@@ -228,10 +191,10 @@ export function EffectsPanel({ state, onChange }: EffectsPanelProps) {
                 type="button"
                 onClick={() => onChange(preset.state)}
                 className={cn(
-                  "px-2 py-1.5 text-xs rounded-md transition-all",
-                  "bg-secondary/60 text-muted-foreground border border-border/30",
-                  "hover:text-foreground hover:border-border hover:bg-secondary",
-                  "active:scale-95",
+                  "flex-1 min-w-[110px] rounded-lg border border-white/8 bg-white/3 px-3 py-2 text-xs",
+                  "text-muted-foreground transition-colors",
+                  "hover:border-white/14 hover:bg-white/6 hover:text-foreground",
+                  "active:scale-[0.98]",
                 )}
                 title={preset.description}
               >
@@ -240,16 +203,16 @@ export function EffectsPanel({ state, onChange }: EffectsPanelProps) {
             );
           })}
         </div>
-      </div>
+      </section>
 
-      <div className="grid grid-cols-1 gap-3">
+      {/* Cards — two columns on >=lg so the page doesn't feel like a
+          thin strip in the middle of the window. */}
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
         {/* EQ */}
         <EffectCard
           title="3-Band EQ"
           description="Shape the low, mid, and high frequencies"
           enabled={state.eq.enabled}
-          accent="cyan"
-          icon={<AudioLines size={16} />}
           onToggle={(on) => patch("eq", { enabled: on })}
         >
           <SliderRow
@@ -286,8 +249,6 @@ export function EffectsPanel({ state, onChange }: EffectsPanelProps) {
           title="DJ Filter"
           description="Low-pass cutoff sweep with resonance"
           enabled={state.filter.enabled}
-          accent="sky"
-          icon={<FilterIcon size={16} />}
           onToggle={(on) => patch("filter", { enabled: on })}
         >
           <SliderRow
@@ -319,8 +280,6 @@ export function EffectsPanel({ state, onChange }: EffectsPanelProps) {
           title="Drive"
           description="Waveshaper saturation with wet/dry mix"
           enabled={state.distortion.enabled}
-          accent="rose"
-          icon={<Flame size={16} />}
           onToggle={(on) => patch("distortion", { enabled: on })}
         >
           <SliderRow
@@ -348,8 +307,6 @@ export function EffectsPanel({ state, onChange }: EffectsPanelProps) {
           title="Compressor"
           description="Glue dynamics with Native / Warm / Bright modes"
           enabled={state.compressor.enabled}
-          accent="amber"
-          icon={<Activity size={16} />}
           onToggle={(on) => patch("compressor", { enabled: on })}
         >
           <ModeSelector
@@ -368,7 +325,6 @@ export function EffectsPanel({ state, onChange }: EffectsPanelProps) {
             max={2}
             step={0.01}
             format={(v) => `${v.toFixed(2)}x`}
-            accent="accent"
             onChange={(v) => patch("compressor", { makeup: v })}
           />
         </EffectCard>
@@ -378,8 +334,6 @@ export function EffectsPanel({ state, onChange }: EffectsPanelProps) {
           title="Reverb"
           description="Convolution reverb with adjustable size"
           enabled={state.reverb.enabled}
-          accent="violet"
-          icon={<Waves size={16} />}
           onToggle={(on) => patch("reverb", { enabled: on })}
         >
           <SliderRow
@@ -407,8 +361,6 @@ export function EffectsPanel({ state, onChange }: EffectsPanelProps) {
           title="Delay"
           description="Echo with feedback and high-end damping"
           enabled={state.delay.enabled}
-          accent="emerald"
-          icon={<Repeat size={16} />}
           onToggle={(on) => patch("delay", { enabled: on })}
         >
           <SliderRow
@@ -445,8 +397,6 @@ export function EffectsPanel({ state, onChange }: EffectsPanelProps) {
           title="Cassette"
           description="Lo-fi bit reduction, sample-rate crush, tape noise"
           enabled={state.cassette.enabled}
-          accent="orange"
-          icon={<CassetteTape size={16} />}
           onToggle={(on) => patch("cassette", { enabled: on })}
         >
           <SliderRow

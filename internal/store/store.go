@@ -21,6 +21,14 @@ type Settings struct {
 	LastTrackPath   string  `json:"lastTrackPath,omitempty"`
 	WindowWidth     int     `json:"windowWidth,omitempty"`
 	WindowHeight    int     `json:"windowHeight,omitempty"`
+	// BackdropOpacity controls how opaque the app's backdrop (the dark
+	// base layer underneath the blurred album art) is. 1.0 = fully
+	// opaque (no desktop bleed-through); lower values let the host
+	// OS's compositor show the desktop wallpaper through the window.
+	// Zero means "use the default" so we can distinguish between
+	// "user never touched this" (0 → treat as default 1.0 at load) and
+	// "user explicitly set transparency" (>0).
+	BackdropOpacity float64 `json:"backdropOpacity,omitempty"`
 }
 
 // LibraryScanResult is the cached library index. Kept in this package
@@ -57,6 +65,7 @@ func defaultSettings() Settings {
 		Volume:          1.0,
 		JumpProbability: 0.25,
 		JumpCooldown:    2.0,
+		BackdropOpacity: 1.0,
 	}
 }
 
@@ -175,6 +184,13 @@ func (s *Store) loadSettings() error {
 	}
 	if loaded.Volume == 0 {
 		loaded.Volume = 1.0
+	}
+	// BackdropOpacity is omitempty so an absent / zero value means
+	// "pre-existing settings file from before this field existed" — fall
+	// back to fully opaque. Legitimate zero is not useful (the app would
+	// be invisible) so treating it as "default" is safe.
+	if loaded.BackdropOpacity <= 0 {
+		loaded.BackdropOpacity = 1.0
 	}
 	s.mu.Lock()
 	s.settings = loaded

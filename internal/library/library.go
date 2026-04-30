@@ -107,11 +107,34 @@ type Library struct {
 
 	mu  sync.RWMutex
 	ctx context.Context
+
+	// decodeCache memoises DecodeTrack results so repeat plays + the
+	// frontend's prefetch pipeline skip the decode cost entirely. Keyed
+	// by absolute path; the cached entry holds the file's mtime so we
+	// invalidate if the file changes on disk. The media URL inside the
+	// cached struct is only trusted if MediaStore still has it — the
+	// two caches can drift because MediaStore has its own LRU eviction
+	// (by byte budget, not by path).
+	decodeMu    sync.Mutex
+	decodeCache map[string]*cachedDecode
+}
+
+// cachedDecode is one entry in the Library's metadata cache. `mtime` is
+// the file's last-modified timestamp at decode time; if it changes the
+// cached result is stale and we redecode.
+type cachedDecode struct {
+	audio DecodedAudio
+	mtime int64
 }
 
 // New builds a Library backed by the given subsystems.
 func New(st *store.Store, ff *ffmpeg.Service, md *media.Store) *Library {
-	return &Library{store: st, ffmpeg: ff, media: md}
+	return &Library{
+		store:       st,
+		ffmpeg:      ff,
+		media:       md,
+		decodeCache: make(map[string]*cachedDecode),
+	}
 }
 
 // AttachContext stores the Wails context so we can emit progress events.
@@ -371,6 +394,25 @@ func (l *Library) DecodeTrack(path string) (DecodedAudio, error) {
 		}
 	}
 
+	// --- Fast path: metadata cache ------------------------------------
+	// If we've already decoded this path (at its current mtime) AND the
+	// MediaStore still has the bytes live, we can skip decoding entirely
+	// and hand back the cached DecodedAudio. This is what makes the
+	// frontend's prefetch pipeline pay off — without it every repeat
+	// DecodeTrack call would generate a fresh token and re-decode.
+	info, statErr := os.Stat(path)
+	var mtime int64
+	if statErr == nil {
+		mtime = info.ModTime().Unix()
+		l.decodeMu.Lock()
+		cached := l.decodeCache[path]
+		l.decodeMu.Unlock()
+		if cached != nil && cached.mtime == mtime && l.media.Has(cached.audio.MediaURL) {
+			logf("cache hit path=%q url=%s", path, cached.audio.MediaURL)
+			return cached.audio, nil
+		}
+	}
+
 	start := time.Now()
 	ext := strings.ToLower(filepath.Ext(path))
 	logf("start path=%q ext=%s", path, ext)
@@ -422,8 +464,11 @@ func (l *Library) DecodeTrack(path string) (DecodedAudio, error) {
 	duration := float64(frames) / float64(sr)
 
 	// Serialise to little-endian bytes and push to the media store.
+	// Dedup key = path + mtime so a reopened file after editing gets a
+	// fresh entry instead of stale bytes.
 	pcmBytes := audio.PCMToLittleEndianBytes(samples)
-	mediaURL, err := l.media.Put("application/octet-stream", pcmBytes)
+	dedupKey := fmt.Sprintf("%s@%d", path, mtime)
+	mediaURL, err := l.media.Put("application/octet-stream", pcmBytes, dedupKey)
 	if err != nil {
 		return DecodedAudio{}, fmt.Errorf("media store: %w", err)
 	}
@@ -451,6 +496,13 @@ func (l *Library) DecodeTrack(path string) (DecodedAudio, error) {
 	}
 	logf("done path=%q duration=%.2fs frames=%d pcm=%d bytes url=%s took=%s",
 		path, duration, frames, len(pcmBytes), mediaURL, time.Since(start))
+
+	// Remember the decoded metadata so the next DecodeTrack for this
+	// path (a repeat play, or the frontend's prefetch) can short-circuit.
+	l.decodeMu.Lock()
+	l.decodeCache[path] = &cachedDecode{audio: out, mtime: mtime}
+	l.decodeMu.Unlock()
+
 	return out, nil
 }
 

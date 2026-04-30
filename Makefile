@@ -188,5 +188,5 @@ doctor:  ## Verify that required tooling is present
 	@printf "Wails:       "; $(WAILS) version 2>/dev/null || echo "not installed (make install-tools)"
 	@printf "ffmpeg:      "; command -v ffmpeg >/dev/null && ffmpeg -version | head -1 || echo "not installed (optional at build time)"
 
-version:  ## Print the version info Wails compiles into the binary
-	@grep -R 'Version: *".*"' app.go || true
+version:  ## Print the app version (constant defined in version.go)
+	@awk -F\" '/^const Version/ { print $$2 }' version.go

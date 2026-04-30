@@ -1,0 +1,433 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Disc3, Play, Search, Shuffle, User } from "lucide-react";
+import { cn } from "@/lib/utils";
+import type { store } from "../../../wailsjs/go/models";
+import { GetCoverArt } from "../../../wailsjs/go/main/App";
+
+type Track = store.Track;
+
+// ---------------------------------------------------------------------------
+// Grouping helpers
+// ---------------------------------------------------------------------------
+
+export interface AlbumGroup {
+  key: string;
+  album: string;
+  artist: string;
+  tracks: Track[];
+  /** Path of the first track in the album that has embedded art, if any. */
+  artworkSource?: string;
+}
+
+export interface ArtistGroup {
+  name: string;
+  tracks: Track[];
+  /** Set of distinct album titles under this artist. */
+  albumCount: number;
+  /** Path of any track with embedded cover art we can use as a thumbnail. */
+  artworkSource?: string;
+}
+
+/**
+ * Group consecutive tracks by (albumArtist|artist, album). Produces stable
+ * album buckets for the Albums grid and the drill-down views. The input
+ * is expected to already be sorted by artist/album (as Library.Scan does)
+ * so consecutive grouping is sufficient and memory-cheap.
+ */
+export function groupByAlbum(tracks: Track[]): AlbumGroup[] {
+  const groups: AlbumGroup[] = [];
+  let current: AlbumGroup | null = null;
+  for (const t of tracks) {
+    const albumKey = (t.album || "Unknown Album").trim();
+    const artistKey = (t.albumArtist || t.artist || "Unknown Artist").trim();
+    const key = `${artistKey}::${albumKey}`;
+    if (!current || current.key !== key) {
+      current = {
+        key,
+        album: albumKey,
+        artist: artistKey,
+        tracks: [],
+        artworkSource: t.hasCoverArt ? t.path : undefined,
+      };
+      groups.push(current);
+    }
+    if (!current.artworkSource && t.hasCoverArt) {
+      current.artworkSource = t.path;
+    }
+    current.tracks.push(t);
+  }
+  return groups;
+}
+
+/**
+ * Group by artist (preferring albumArtist when set). Unlike groupByAlbum
+ * this is an O(n) pass over the full track list — we need all tracks per
+ * artist, not just consecutive runs.
+ */
+export function groupByArtist(tracks: Track[]): ArtistGroup[] {
+  const byName = new Map<string, ArtistGroup>();
+  for (const t of tracks) {
+    const name = (t.albumArtist || t.artist || "Unknown Artist").trim();
+    let g = byName.get(name);
+    if (!g) {
+      g = {
+        name,
+        tracks: [],
+        albumCount: 0,
+        artworkSource: t.hasCoverArt ? t.path : undefined,
+      };
+      byName.set(name, g);
+    }
+    if (!g.artworkSource && t.hasCoverArt) g.artworkSource = t.path;
+    g.tracks.push(t);
+  }
+  // Count distinct albums per artist.
+  for (const g of byName.values()) {
+    const albums = new Set<string>();
+    for (const t of g.tracks) albums.add((t.album || "Unknown Album").trim());
+    g.albumCount = albums.size;
+  }
+  return Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// ---------------------------------------------------------------------------
+// Cover-art fetcher
+// ---------------------------------------------------------------------------
+
+// A small cache so switching between modes doesn't re-fetch art we've
+// already loaded. Keyed by the track path the art came from.
+const coverCache = new Map<string, string | null>();
+
+function useCoverArt(source?: string): string | null {
+  const [art, setArt] = useState<string | null>(() =>
+    source ? coverCache.get(source) ?? null : null,
+  );
+  const requested = useRef(false);
+  useEffect(() => {
+    if (!source) {
+      setArt(null);
+      return;
+    }
+    const cached = coverCache.get(source);
+    if (cached !== undefined) {
+      setArt(cached);
+      return;
+    }
+    if (requested.current) return;
+    requested.current = true;
+    let cancelled = false;
+    GetCoverArt(source).then((url) => {
+      const resolved = url || null;
+      coverCache.set(source, resolved);
+      if (!cancelled) setArt(resolved);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [source]);
+  return art;
+}
+
+// ---------------------------------------------------------------------------
+// AlbumsGrid — tile view of the library grouped by album
+// ---------------------------------------------------------------------------
+
+interface AlbumsGridProps {
+  tracks: Track[];
+  onSelect: (album: AlbumGroup) => void;
+  onPlay: (album: AlbumGroup) => void;
+  onShuffle: (album: AlbumGroup) => void;
+}
+
+export function AlbumsGrid({ tracks, onSelect, onPlay, onShuffle }: AlbumsGridProps) {
+  const [query, setQuery] = useState("");
+  const groups = useMemo(() => groupByAlbum(tracks), [tracks]);
+  const filtered = useMemo(() => {
+    if (!query.trim()) return groups;
+    const q = query.toLowerCase();
+    return groups.filter(
+      (g) =>
+        g.album.toLowerCase().includes(q) ||
+        g.artist.toLowerCase().includes(q),
+    );
+  }, [groups, query]);
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <SearchBar
+        query={query}
+        onChange={setQuery}
+        placeholder="Search albums or artist"
+        summary={`${groups.length.toLocaleString()} album${groups.length === 1 ? "" : "s"}`}
+      />
+      <div className="scroll-thin flex-1 overflow-y-auto px-6 pb-6">
+        {filtered.length === 0 ? (
+          <div className="flex h-40 items-center justify-center text-sm text-muted-foreground">
+            {query ? "No albums match." : "No albums in your library."}
+          </div>
+        ) : (
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(176px,1fr))] gap-5">
+            {filtered.map((g) => (
+              <AlbumCard
+                key={g.key}
+                group={g}
+                onOpen={() => onSelect(g)}
+                onPlay={() => onPlay(g)}
+                onShuffle={() => onShuffle(g)}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AlbumCard({
+  group,
+  onOpen,
+  onPlay,
+  onShuffle,
+}: {
+  group: AlbumGroup;
+  onOpen: () => void;
+  onPlay: () => void;
+  onShuffle: () => void;
+}) {
+  const art = useCoverArt(group.artworkSource);
+  return (
+    <div className="group/card flex flex-col gap-2">
+      <button
+        type="button"
+        onClick={onOpen}
+        className={cn(
+          "relative aspect-square w-full overflow-hidden rounded-xl border border-white/8 bg-white/[0.03]",
+          "transition-all hover:border-white/18",
+        )}
+        aria-label={`Open ${group.album}`}
+      >
+        {art ? (
+          <img src={art} alt="" className="h-full w-full object-cover" />
+        ) : (
+          <div className="flex h-full w-full items-center justify-center bg-white/[0.03]">
+            <Disc3 size={40} className="text-muted-foreground/40" />
+          </div>
+        )}
+        {/* Hover overlay: play + shuffle */}
+        <div className="pointer-events-none absolute inset-0 flex items-end justify-end gap-2 bg-gradient-to-t from-black/50 via-black/10 to-transparent p-3 opacity-0 transition-opacity group-hover/card:opacity-100">
+          <HoverAction
+            label="Shuffle"
+            onClick={(e) => {
+              e.stopPropagation();
+              onShuffle();
+            }}
+          >
+            <Shuffle size={13} />
+          </HoverAction>
+          <HoverAction
+            label="Play"
+            primary
+            onClick={(e) => {
+              e.stopPropagation();
+              onPlay();
+            }}
+          >
+            <Play size={13} fill="currentColor" className="ml-0.5" />
+          </HoverAction>
+        </div>
+      </button>
+      <button
+        type="button"
+        onClick={onOpen}
+        className="min-w-0 text-left"
+      >
+        <p className="truncate text-sm font-semibold text-foreground">{group.album}</p>
+        <p className="truncate text-xs text-muted-foreground">{group.artist}</p>
+        <p className="text-[10px] font-mono tabular-nums text-muted-foreground/70">
+          {group.tracks.length} track{group.tracks.length === 1 ? "" : "s"}
+        </p>
+      </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ArtistsList — list of artists with a round thumbnail
+// ---------------------------------------------------------------------------
+
+interface ArtistsListProps {
+  tracks: Track[];
+  onSelect: (artist: ArtistGroup) => void;
+  onPlay: (artist: ArtistGroup) => void;
+  onShuffle: (artist: ArtistGroup) => void;
+}
+
+export function ArtistsList({ tracks, onSelect, onPlay, onShuffle }: ArtistsListProps) {
+  const [query, setQuery] = useState("");
+  const groups = useMemo(() => groupByArtist(tracks), [tracks]);
+  const filtered = useMemo(() => {
+    if (!query.trim()) return groups;
+    const q = query.toLowerCase();
+    return groups.filter((g) => g.name.toLowerCase().includes(q));
+  }, [groups, query]);
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <SearchBar
+        query={query}
+        onChange={setQuery}
+        placeholder="Search artists"
+        summary={`${groups.length.toLocaleString()} artist${groups.length === 1 ? "" : "s"}`}
+      />
+      <div className="scroll-thin flex-1 overflow-y-auto px-6 pb-6">
+        {filtered.length === 0 ? (
+          <div className="flex h-40 items-center justify-center text-sm text-muted-foreground">
+            {query ? "No artists match." : "No artists in your library."}
+          </div>
+        ) : (
+          <ul className="flex flex-col divide-y divide-white/5 overflow-hidden rounded-xl border border-white/5 bg-white/[0.02]">
+            {filtered.map((g) => (
+              <ArtistRow
+                key={g.name}
+                group={g}
+                onOpen={() => onSelect(g)}
+                onPlay={() => onPlay(g)}
+                onShuffle={() => onShuffle(g)}
+              />
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ArtistRow({
+  group,
+  onOpen,
+  onPlay,
+  onShuffle,
+}: {
+  group: ArtistGroup;
+  onOpen: () => void;
+  onPlay: () => void;
+  onShuffle: () => void;
+}) {
+  const art = useCoverArt(group.artworkSource);
+  return (
+    <li className="group/row flex items-center gap-3 px-3 py-2.5 transition-colors hover:bg-white/3">
+      <button
+        type="button"
+        onClick={onOpen}
+        className="flex min-w-0 flex-1 items-center gap-3 text-left"
+      >
+        <div className="size-11 shrink-0 overflow-hidden rounded-full border border-white/10 bg-white/[0.04]">
+          {art ? (
+            <img src={art} alt="" className="h-full w-full object-cover" />
+          ) : (
+            <div className="flex h-full w-full items-center justify-center">
+              <User size={16} className="text-muted-foreground/50" />
+            </div>
+          )}
+        </div>
+        <div className="min-w-0">
+          <p className="truncate text-sm font-semibold text-foreground">{group.name}</p>
+          <p className="truncate text-[11px] text-muted-foreground">
+            {group.tracks.length} track{group.tracks.length === 1 ? "" : "s"}
+            {" · "}
+            {group.albumCount} album{group.albumCount === 1 ? "" : "s"}
+          </p>
+        </div>
+      </button>
+      <div className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover/row:opacity-100 focus-within:opacity-100">
+        <button
+          type="button"
+          onClick={onShuffle}
+          aria-label={`Shuffle ${group.name}`}
+          className="flex size-8 items-center justify-center rounded-full text-muted-foreground hover:bg-white/8 hover:text-foreground"
+        >
+          <Shuffle size={13} />
+        </button>
+        <button
+          type="button"
+          onClick={onPlay}
+          aria-label={`Play ${group.name}`}
+          className="flex size-8 items-center justify-center rounded-full bg-white text-black hover:brightness-95"
+        >
+          <Play size={13} fill="currentColor" className="ml-0.5" />
+        </button>
+      </div>
+    </li>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Shared little bits
+// ---------------------------------------------------------------------------
+
+function SearchBar({
+  query,
+  onChange,
+  placeholder,
+  summary,
+}: {
+  query: string;
+  onChange: (v: string) => void;
+  placeholder: string;
+  summary: string;
+}) {
+  return (
+    <div className="px-6 pt-2 pb-4">
+      <div className="flex items-baseline justify-between gap-4 pb-3">
+        <p className="text-xs tabular-nums text-muted-foreground">{summary}</p>
+      </div>
+      <div className="flex items-center gap-2 rounded-full border border-white/8 bg-white/3 px-3.5 py-2 backdrop-blur">
+        <Search size={13} className="text-muted-foreground" />
+        <input
+          value={query}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+          className="flex-1 bg-transparent text-sm placeholder:text-muted-foreground/60 focus:outline-none"
+        />
+        {query && (
+          <button
+            type="button"
+            onClick={() => onChange("")}
+            className="text-xs text-muted-foreground hover:text-foreground"
+          >
+            clear
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function HoverAction({
+  primary = false,
+  onClick,
+  label,
+  children,
+}: {
+  primary?: boolean;
+  onClick: (e: React.MouseEvent) => void;
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={label}
+      className={cn(
+        "pointer-events-auto flex size-9 items-center justify-center rounded-full",
+        "shadow-[0_4px_14px_rgba(0,0,0,0.45)]",
+        primary
+          ? "bg-white text-black hover:brightness-95"
+          : "bg-black/40 text-white backdrop-blur hover:bg-black/55",
+      )}
+    >
+      {children}
+    </button>
+  );
+}

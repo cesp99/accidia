@@ -70,6 +70,15 @@ export function useAudioEngine() {
   });
   const effectsStateRef = useRef<EffectsState>(defaultEffectsState);
   const volumeRef = useRef<number>(1);
+  // Whether the engine should auto-loop the current track when it reaches
+  // the end. True keeps the Infinite Jukebox runtime happy (jumps dominate
+  // but we still want a fallback); false means we defer to the caller via
+  // `onTrackEndRef`, typically to advance the queue or stop playback.
+  const shouldLoopRef = useRef<boolean>(true);
+  const onTrackEndRef = useRef<(() => void) | null>(null);
+  // Guards against double-firing onTrackEnd if rAF ticks multiple times
+  // past the end-of-track threshold before the caller swaps the buffer.
+  const trackEndFiredRef = useRef<boolean>(false);
 
   const playbackStateRef = useRef<PlaybackState>({
     isPlaying: false,
@@ -252,10 +261,37 @@ export function useAudioEngine() {
           });
         }
       } else {
-        // Loop back if near end
+        // End-of-track handling. Fires at duration - 0.1s so we have a
+        // little headroom before the buffer genuinely runs out.
         if (currentAudioTime >= duration - 0.1) {
-          playFrom(beats[0].time);
-          updateState({ currentBeat: 0, currentTime: beats[0].time, playedSeconds });
+          if (shouldLoopRef.current) {
+            // Loop mode: seamless restart from beat 0. Used in Jukebox
+            // mode and when the caller has repeat=one.
+            playFrom(beats[0].time);
+            updateState({ currentBeat: 0, currentTime: beats[0].time, playedSeconds });
+          } else {
+            // Advance mode: hand control to the caller (via onTrackEnd)
+            // who will either load the next track or pause. We still
+            // need to let the current rAF loop exit so we don't keep
+            // firing the callback every 16ms.
+            if (!trackEndFiredRef.current) {
+              trackEndFiredRef.current = true;
+              const cb = onTrackEndRef.current;
+              if (cb) {
+                // Dispatch asynchronously so callers can safely update
+                // state (which will re-render and potentially unmount
+                // this engine's consumer) without racing the rAF frame.
+                queueMicrotask(cb);
+              }
+            }
+            // Keep updating state so the UI sees we're still near the end
+            // until the caller swaps the buffer.
+            updateState({
+              currentBeat: currentBeatIdx,
+              currentTime: currentAudioTime,
+              playedSeconds,
+            });
+          }
         } else {
           updateState({
             currentBeat: currentBeatIdx,
@@ -291,6 +327,7 @@ export function useAudioEngine() {
       startOffsetRef.current = 0;
       lastJumpAudioTimeRef.current = -Infinity;
       lastLoopContextTimeRef.current = null;
+      trackEndFiredRef.current = false;
       updateState({
         currentBeat: 0,
         currentTime: 0,
@@ -329,6 +366,13 @@ export function useAudioEngine() {
 
     if (ctx.state === "suspended") ctx.resume();
 
+    // Idempotent when already playing: without this guard a second
+    // play() (e.g. from a media key when the OS re-sends Play instead
+    // of PlayPause) restarts the source from `startOffsetRef.current`,
+    // which is the last *playFrom* offset — usually 0 on a fresh
+    // load — and the song appears to jump back to the beginning.
+    if (playbackStateRef.current.isPlaying) return;
+
     const offset = startOffsetRef.current;
     playFrom(offset);
     lastLoopContextTimeRef.current = ctx.currentTime;
@@ -353,6 +397,7 @@ export function useAudioEngine() {
     if (!beats[beatIndex]) return;
     const time = beats[beatIndex].time;
     startOffsetRef.current = time;
+    trackEndFiredRef.current = false; // seeking away from the end re-arms onTrackEnd
 
     if (playbackStateRef.current.isPlaying) {
       playFrom(time);
@@ -367,6 +412,7 @@ export function useAudioEngine() {
     const maxDuration = audioBufferRef.current?.duration ?? beats[beats.length - 1].time;
     const clamped = Math.max(0, Math.min(timeSeconds, maxDuration));
     startOffsetRef.current = clamped;
+    trackEndFiredRef.current = false; // seeking away from the end re-arms onTrackEnd
 
     let nearestBeatIdx = 0;
     let nearestDistance = Infinity;
@@ -401,6 +447,26 @@ export function useAudioEngine() {
     const v = Math.max(0, Math.min(1.5, volume));
     volumeRef.current = v;
     effectsChainRef.current?.setMasterGain(v);
+  }, []);
+
+  /** Toggle whether the engine auto-loops the current track at end. */
+  const setShouldLoop = useCallback((loop: boolean) => {
+    shouldLoopRef.current = loop;
+    if (loop) {
+      // Leaving advance-mode: re-arm the fired flag so if we later flip
+      // back and the track happens to be near its end, onTrackEnd fires
+      // again as expected.
+      trackEndFiredRef.current = false;
+    }
+  }, []);
+
+  /**
+   * Register a callback fired when the current track naturally reaches
+   * its end AND shouldLoop is false. Exactly one fire per track-end —
+   * reset by loading a new track or seeking away from the tail.
+   */
+  const setOnTrackEnd = useCallback((cb: (() => void) | null) => {
+    onTrackEndRef.current = cb;
   }, []);
 
   const reset = useCallback(() => {
@@ -451,6 +517,8 @@ export function useAudioEngine() {
     setJumpSettings,
     setEffectsState,
     setVolume,
+    setShouldLoop,
+    setOnTrackEnd,
     playbackState,
     getCurrentAudioTime,
   };

@@ -11,6 +11,7 @@ import {
   MoreHorizontal,
   Pencil,
   Trash2,
+  Settings as SettingsIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Playlist } from "@/hooks/use-playlists";
@@ -27,6 +28,7 @@ export type View =
   | "lyrics"
   | "effects"
   | "favorites"
+  | "settings"
   | { type: "playlist"; id: string };
 
 interface SidebarProps {
@@ -58,6 +60,7 @@ const NAV: NavItem[] = [
   { id: "now-playing", label: "Now Playing", icon: Disc3 },
   { id: "lyrics", label: "Lyrics", icon: Mic2 },
   { id: "effects", label: "Effects", icon: SlidersHorizontal },
+  { id: "settings", label: "Settings", icon: SettingsIcon },
 ];
 
 /**
@@ -101,7 +104,7 @@ export function Sidebar({
               <Icon size={16} className={cn(active && "text-primary")} />
               <span className="flex-1 truncate text-sm font-medium">{item.label}</span>
               {item.id === "now-playing" && isPlaying && (
-                <span className="size-1.5 rounded-full bg-primary shadow-[0_0_8px_rgba(0,229,255,0.55)]" />
+                <span className="size-1.5 rounded-full bg-white shadow-[0_0_8px_rgba(255,255,255,0.45)]" />
               )}
               {item.id === "favorites" && favoritesCount > 0 && (
                 <span className="text-[10px] font-mono tabular-nums text-muted-foreground/70">
@@ -148,7 +151,7 @@ function JukeboxToggle({ active, onToggle }: { active: boolean; onToggle?: () =>
         className={cn(
           "flex size-8 shrink-0 items-center justify-center rounded-lg transition-colors",
           active
-            ? "bg-primary/20 text-primary shadow-[0_0_20px_rgba(0,229,255,0.35)]"
+            ? "bg-white/15 text-foreground shadow-[0_0_18px_rgba(255,255,255,0.18)]"
             : "bg-white/5 text-muted-foreground group-hover:text-foreground",
         )}
       >

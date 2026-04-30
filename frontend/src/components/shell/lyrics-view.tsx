@@ -28,7 +28,7 @@ interface FetchState {
  * Design cues:
  *  - Huge, heavy, left-aligned lines. Not a centered lyric card.
  *  - Active line is 100% opaque with a subtle pulse.
- *  - Past lines dim to ~30% opacity.
+ *  - Past lines dim to ~10% opacity.
  *  - Future lines are readable but at ~55% so the eye knows where to go.
  *  - No borders, no panels — the lyrics ARE the canvas.
  *  - Smooth ease-out scroll follows the active line on every tick.
@@ -212,10 +212,6 @@ export function LyricsView({
           </div>
           {/* Generous bottom spacer. */}
           <div className="h-[42vh]" />
-
-          {/* Subtle top/bottom masks so lines gracefully enter/exit. */}
-          <div className="pointer-events-none absolute inset-x-0 top-0 h-24 bg-gradient-to-b from-black/25 to-transparent" />
-          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-24 bg-gradient-to-t from-black/25 to-transparent" />
 
           {!isPlaying && (
             <div className="pointer-events-none absolute inset-x-0 top-4 flex justify-center">

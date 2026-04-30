@@ -1,7 +1,25 @@
-import { useEffect, useState } from "react";
-import { FolderOpen, Loader2, Music2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  ArrowLeft,
+  FolderOpen,
+  LayoutGrid,
+  List,
+  Loader2,
+  Music2,
+  Play,
+  Shuffle,
+  User,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import { TrackList } from "./track-list";
+import {
+  AlbumsGrid,
+  ArtistsList,
+  groupByAlbum,
+  groupByArtist,
+  type AlbumGroup,
+  type ArtistGroup,
+} from "./library-browsers";
 import {
   GetLibrary,
   PickLibraryFolder,
@@ -11,11 +29,49 @@ import { EventsOn } from "../../../wailsjs/runtime/runtime";
 import type { store } from "../../../wailsjs/go/models";
 import type { Playlist } from "@/hooks/use-playlists";
 
+type Track = store.Track;
+
+// ---------------------------------------------------------------------------
+// View-mode helpers
+// ---------------------------------------------------------------------------
+
+type Mode = "all" | "albums" | "artists";
+
+type Drill =
+  | { type: "album"; key: string }
+  | { type: "artist"; name: string }
+  | null;
+
+const MODE_STORAGE_KEY = "accidia.library.mode.v1";
+
+function loadMode(): Mode {
+  try {
+    const raw = localStorage.getItem(MODE_STORAGE_KEY);
+    if (raw === "albums" || raw === "artists" || raw === "all") return raw;
+  } catch {
+    /* non-fatal */
+  }
+  return "all";
+}
+
+function saveMode(mode: Mode) {
+  try {
+    localStorage.setItem(MODE_STORAGE_KEY, mode);
+  } catch {
+    /* non-fatal */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// LibraryView — the big one
+// ---------------------------------------------------------------------------
+
 interface LibraryViewProps {
   currentPath?: string;
-  onPlay: (track: store.Track, albumTracks: store.Track[], albumLabel: string) => void;
-  onPlayNext: (tracks: store.Track[]) => void;
-  onAddToQueue: (tracks: store.Track[]) => void;
+  onPlay: (track: Track, albumTracks: Track[], albumLabel: string) => void;
+  onShufflePlay: (tracks: Track[], label: string) => void;
+  onPlayNext: (tracks: Track[]) => void;
+  onAddToQueue: (tracks: Track[]) => void;
   isFavorite: (path: string) => boolean;
   onToggleFavorite: (path: string) => void;
   playlists: Playlist[];
@@ -34,6 +90,7 @@ interface ScanProgress {
 export function LibraryView({
   currentPath,
   onPlay,
+  onShufflePlay,
   onPlayNext,
   onAddToQueue,
   isFavorite,
@@ -47,6 +104,14 @@ export function LibraryView({
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState<ScanProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [mode, setModeState] = useState<Mode>(() => loadMode());
+  const [drill, setDrill] = useState<Drill>(null);
+
+  const setMode = useCallback((m: Mode) => {
+    setModeState(m);
+    setDrill(null); // mode switch always clears the drill-down
+    saveMode(m);
+  }, []);
 
   // Initial load: pull whatever's cached on disk so the UI fills instantly.
   useEffect(() => {
@@ -77,6 +142,7 @@ export function LibraryView({
       const result = await ScanLibrary(path);
       setLibrary(result);
       onLibraryLoad?.(result);
+      setDrill(null);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -93,6 +159,7 @@ export function LibraryView({
       const result = await ScanLibrary(library.root);
       setLibrary(result);
       onLibraryLoad?.(result);
+      setDrill(null);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -102,6 +169,21 @@ export function LibraryView({
   };
 
   const tracks = library?.tracks ?? [];
+
+  // Resolve the drilled-down bucket from the full track list. Computed
+  // unconditionally (rules-of-hooks) — returns null when no drill is
+  // active or when the library hasn't been loaded yet.
+  const drilledAlbum = useMemo<AlbumGroup | null>(() => {
+    if (drill?.type !== "album" || tracks.length === 0) return null;
+    const all = groupByAlbum(tracks);
+    return all.find((g) => g.key === drill.key) ?? null;
+  }, [drill, tracks]);
+
+  const drilledArtist = useMemo<ArtistGroup | null>(() => {
+    if (drill?.type !== "artist" || tracks.length === 0) return null;
+    const all = groupByArtist(tracks);
+    return all.find((g) => g.name === drill.name) ?? null;
+  }, [drill, tracks]);
 
   if (!library || tracks.length === 0) {
     return (
@@ -114,77 +196,265 @@ export function LibraryView({
     );
   }
 
+  // ---- Common row/list props piped into TrackList ----------------------
+  const rowCommon = {
+    isFavorite,
+    onToggleFavorite,
+    playlists,
+    onAddToPlaylist,
+    onCreatePlaylistWithTracks,
+    onPlayNext,
+    onAddToQueue,
+  };
+
+  // ---- Body: branches on drill-down > mode ----------------------------
+  const body = (() => {
+    if (drilledAlbum) {
+      const label = `${drilledAlbum.album} · ${drilledAlbum.artist}`;
+      return (
+        <TrackList
+          heading={drilledAlbum.album}
+          tracks={drilledAlbum.tracks}
+          currentPath={currentPath}
+          onPlay={(t) => onPlay(t, drilledAlbum.tracks, label)}
+          headerActions={
+            <PlayShuffleButtons
+              onPlay={() => onPlay(drilledAlbum.tracks[0], drilledAlbum.tracks, label)}
+              onShuffle={() => onShufflePlay(drilledAlbum.tracks, label)}
+            />
+          }
+          flat
+          sourceLabel={label}
+          hideSearch
+          {...rowCommon}
+        />
+      );
+    }
+    if (drilledArtist) {
+      const label = `Artist: ${drilledArtist.name}`;
+      return (
+        <TrackList
+          heading={drilledArtist.name}
+          tracks={drilledArtist.tracks}
+          currentPath={currentPath}
+          onPlay={(t, albumTracks, albumLabel) => onPlay(t, albumTracks, albumLabel)}
+          headerActions={
+            <PlayShuffleButtons
+              onPlay={() =>
+                onPlay(drilledArtist.tracks[0], drilledArtist.tracks, label)
+              }
+              onShuffle={() => onShufflePlay(drilledArtist.tracks, label)}
+            />
+          }
+          sourceLabel={label}
+          {...rowCommon}
+        />
+      );
+    }
+    if (mode === "albums") {
+      return (
+        <AlbumsGrid
+          tracks={tracks}
+          onSelect={(g) => setDrill({ type: "album", key: g.key })}
+          onPlay={(g) => onPlay(g.tracks[0], g.tracks, `${g.album} · ${g.artist}`)}
+          onShuffle={(g) => onShufflePlay(g.tracks, `${g.album} · ${g.artist}`)}
+        />
+      );
+    }
+    if (mode === "artists") {
+      return (
+        <ArtistsList
+          tracks={tracks}
+          onSelect={(g) => setDrill({ type: "artist", name: g.name })}
+          onPlay={(g) => onPlay(g.tracks[0], g.tracks, `Artist: ${g.name}`)}
+          onShuffle={(g) => onShufflePlay(g.tracks, `Artist: ${g.name}`)}
+        />
+      );
+    }
+    // mode === "all"
+    return (
+      <TrackList
+        heading="Library"
+        tracks={tracks}
+        currentPath={currentPath}
+        onPlay={onPlay}
+        headerActions={
+          <PlayShuffleButtons
+            onPlay={() => onPlay(tracks[0], tracks, "Library")}
+            onShuffle={() => onShufflePlay(tracks, "Library")}
+            compact
+          />
+        }
+        sourceLabel="Library"
+        {...rowCommon}
+      />
+    );
+  })();
+
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex items-center justify-between gap-3 px-6 pt-4">
-        <div className="flex min-w-0 flex-col">
-          <p className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-            Music folder
-          </p>
-          <p className="truncate font-mono text-xs text-foreground/70">{library.root}</p>
+      {/* Folder strip + view-mode switcher. When drilled-down we hide
+          the mode switcher and show a back button instead. */}
+      <div className="flex flex-wrap items-center justify-between gap-3 px-6 pt-4">
+        <div className="flex min-w-0 items-center gap-3">
+          {drill ? (
+            <button
+              type="button"
+              onClick={() => setDrill(null)}
+              className={cn(
+                "inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs",
+                "text-muted-foreground transition-colors hover:bg-white/10 hover:text-foreground",
+              )}
+            >
+              <ArrowLeft size={13} />
+              {drill.type === "album" ? "Albums" : "Artists"}
+            </button>
+          ) : (
+            <ModeSwitcher mode={mode} onChange={setMode} />
+          )}
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <button
-            type="button"
-            onClick={handleRescan}
-            disabled={scanning}
-            className={cn(
-              "rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-muted-foreground",
-              "transition-colors hover:bg-white/10 hover:text-foreground",
-              "disabled:opacity-50",
-            )}
-          >
-            {scanning ? "Rescanning…" : "Rescan"}
-          </button>
-          <button
-            type="button"
-            onClick={handlePickFolder}
-            disabled={scanning}
-            className={cn(
-              "rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-muted-foreground",
-              "transition-colors hover:bg-white/10 hover:text-foreground",
-              "disabled:opacity-50",
-            )}
-          >
-            Change folder
-          </button>
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="flex min-w-0 flex-col text-right">
+            <p className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
+              Music folder
+            </p>
+            <p className="truncate font-mono text-xs text-foreground/70">{library.root}</p>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              onClick={handleRescan}
+              disabled={scanning}
+              className={cn(
+                "rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-muted-foreground",
+                "transition-colors hover:bg-white/10 hover:text-foreground",
+                "disabled:opacity-50",
+              )}
+            >
+              {scanning ? "Rescanning…" : "Rescan"}
+            </button>
+            <button
+              type="button"
+              onClick={handlePickFolder}
+              disabled={scanning}
+              className={cn(
+                "rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-muted-foreground",
+                "transition-colors hover:bg-white/10 hover:text-foreground",
+                "disabled:opacity-50",
+              )}
+            >
+              Change folder
+            </button>
+          </div>
         </div>
       </div>
       {scanning && progress && <ScanBar progress={progress} />}
       {error && <p className="px-6 pt-2 text-xs text-destructive">{error}</p>}
-      <div className="min-h-0 flex-1">
-        <TrackList
-          tracks={tracks}
-          currentPath={currentPath}
-          onPlay={onPlay}
-          onPlayNext={onPlayNext}
-          onAddToQueue={onAddToQueue}
-          isFavorite={isFavorite}
-          onToggleFavorite={onToggleFavorite}
-          playlists={playlists}
-          onAddToPlaylist={onAddToPlaylist}
-          onCreatePlaylistWithTracks={onCreatePlaylistWithTracks}
-        />
-      </div>
+      <div className="min-h-0 flex-1">{body}</div>
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Mode switcher (segmented control)
+// ---------------------------------------------------------------------------
+
+function ModeSwitcher({
+  mode,
+  onChange,
+}: {
+  mode: Mode;
+  onChange: (m: Mode) => void;
+}) {
+  const opts: Array<{ id: Mode; label: string; icon: React.ComponentType<{ size?: number }> }> = [
+    { id: "all", label: "All", icon: List },
+    { id: "albums", label: "Albums", icon: LayoutGrid },
+    { id: "artists", label: "Artists", icon: User },
+  ];
+  return (
+    <div className="inline-flex items-center gap-0.5 rounded-full border border-white/8 bg-white/3 p-0.5">
+      {opts.map((o) => {
+        const active = mode === o.id;
+        const Icon = o.icon;
+        return (
+          <button
+            key={o.id}
+            type="button"
+            onClick={() => onChange(o.id)}
+            aria-pressed={active}
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs transition-colors",
+              active
+                ? "bg-white text-black"
+                : "text-muted-foreground hover:bg-white/6 hover:text-foreground",
+            )}
+          >
+            <Icon size={13} />
+            <span>{o.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Play + Shuffle buttons (shared between drill views + all-mode header)
+// ---------------------------------------------------------------------------
+
+function PlayShuffleButtons({
+  onPlay,
+  onShuffle,
+  compact = false,
+}: {
+  onPlay: () => void;
+  onShuffle: () => void;
+  compact?: boolean;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <button
+        type="button"
+        onClick={onShuffle}
+        className={cn(
+          "inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs",
+          "text-muted-foreground transition-colors hover:bg-white/10 hover:text-foreground",
+        )}
+      >
+        <Shuffle size={11} />
+        {compact ? "Shuffle" : "Shuffle"}
+      </button>
+      <button
+        type="button"
+        onClick={onPlay}
+        className="inline-flex items-center gap-1.5 rounded-full bg-white px-3 py-1 text-xs font-semibold text-black hover:brightness-95 active:scale-95"
+      >
+        <Play size={11} fill="currentColor" />
+        Play
+      </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Scan progress bar
+// ---------------------------------------------------------------------------
 
 function ScanBar({ progress }: { progress: ScanProgress }) {
   const pct = progress.total > 0 ? (progress.scanned / progress.total) * 100 : 0;
   return (
     <div className="px-6 pt-3">
-      <div className="rounded-lg border border-primary/20 bg-primary/5 p-3">
-        <div className="flex items-center gap-2 text-xs text-primary">
+      <div className="rounded-lg border border-white/10 bg-white/5 p-3">
+        <div className="flex items-center gap-2 text-xs text-foreground">
           <Loader2 size={12} className="animate-spin" />
           <span className="font-medium">{progress.label}</span>
-          <span className="ml-auto font-mono tabular-nums">
+          <span className="ml-auto font-mono tabular-nums text-muted-foreground">
             {progress.scanned}/{progress.total || "?"}
           </span>
         </div>
         <div className="mt-2 h-1 overflow-hidden rounded-full bg-white/8">
           <div
-            className="h-full bg-primary transition-[width] duration-100"
+            className="h-full bg-white transition-[width] duration-100"
             style={{ width: `${pct}%` }}
           />
         </div>
@@ -192,6 +462,10 @@ function ScanBar({ progress }: { progress: ScanProgress }) {
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Welcome (empty state)
+// ---------------------------------------------------------------------------
 
 function Welcome({
   onPickFolder,

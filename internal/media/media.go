@@ -3,6 +3,11 @@
 // an HTTP handler. Using HTTP over the internal port keeps us off the
 // JSON-IPC bus (which is brittle above ~10 MB on WebKit2GTK) and lets
 // the browser's Web Audio pipeline stream the body efficiently.
+//
+// A secondary "dedup key" (typically the absolute file path + mtime)
+// lets callers reuse an existing entry across repeat decodes — the
+// frontend's prefetch pipeline relies on this to make Next-track
+// switching near-instant.
 package media
 
 import (
@@ -22,13 +27,15 @@ import (
 type Store struct {
 	mu      sync.Mutex
 	entries map[string]*entry
-	order   []string // oldest first
+	byKey   map[string]string // user-provided dedup key -> token
+	order   []string          // oldest first
 	limit   int
 }
 
 type entry struct {
 	bytes     []byte
 	mime      string
+	key       string // the dedup key the caller supplied, "" when none
 	createdAt time.Time
 }
 
@@ -41,34 +48,79 @@ func New(limit int) *Store {
 	}
 	return &Store{
 		entries: make(map[string]*entry, limit),
+		byKey:   make(map[string]string, limit),
 		limit:   limit,
 	}
 }
 
-// Put registers a new payload and returns a stable URL path the frontend
-// can fetch. The token is random so we don't leak filesystem paths.
-func (m *Store) Put(mime string, body []byte) (string, error) {
+// Put registers a new payload keyed by `key` (typically the track path
+// plus its mtime for cache invalidation on file change). If a payload
+// with the same key is already present, returns its existing URL and
+// bumps it to most-recently-used — skipping the decode work upstream.
+// Pass an empty key to opt out of dedup (fresh token every time).
+func (m *Store) Put(mime string, body []byte, key string) (string, error) {
 	if len(body) == 0 {
 		return "", errors.New("media: empty payload")
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Cache hit: return existing URL, bump LRU.
+	if key != "" {
+		if token, ok := m.byKey[key]; ok {
+			if _, live := m.entries[token]; live {
+				m.bumpLocked(token)
+				return "/media/" + token, nil
+			}
+			// Stale mapping (the entry was evicted but byKey wasn't
+			// cleaned up — shouldn't happen with the new eviction
+			// path, but defensive).
+			delete(m.byKey, key)
+		}
+	}
+
 	token, err := randomToken()
 	if err != nil {
 		return "", err
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	// Evict oldest entries until there's room for the new one.
 	for len(m.order)+1 > m.limit {
 		old := m.order[0]
 		m.order = m.order[1:]
+		if oldEntry := m.entries[old]; oldEntry != nil && oldEntry.key != "" {
+			delete(m.byKey, oldEntry.key)
+		}
 		delete(m.entries, old)
 	}
 	m.entries[token] = &entry{
 		bytes:     body,
 		mime:      mime,
+		key:       key,
 		createdAt: time.Now(),
 	}
 	m.order = append(m.order, token)
+	if key != "" {
+		m.byKey[key] = token
+	}
 	return "/media/" + token, nil
+}
+
+// Has reports whether the given URL (returned previously by Put) is
+// still live. Callers with an external metadata cache use this to
+// check whether they can return their cached metadata without
+// re-decoding.
+func (m *Store) Has(url string) bool {
+	token := strings.TrimPrefix(url, "/media/")
+	if token == "" || token == url {
+		return false
+	}
+	if i := strings.IndexAny(token, "/?"); i != -1 {
+		token = token[:i]
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.entries[token]
+	return ok
 }
 
 // Clear drops all cached entries. Useful on track change if we want to
@@ -77,7 +129,20 @@ func (m *Store) Clear() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.entries = make(map[string]*entry)
+	m.byKey = make(map[string]string)
 	m.order = nil
+}
+
+// bumpLocked moves the given token to the end of the LRU order.
+// Caller must hold m.mu.
+func (m *Store) bumpLocked(token string) {
+	for i, t := range m.order {
+		if t == token {
+			m.order = append(m.order[:i], m.order[i+1:]...)
+			m.order = append(m.order, token)
+			return
+		}
+	}
 }
 
 // ServeHTTP is the asset server handler. Wails routes any request whose
