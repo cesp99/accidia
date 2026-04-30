@@ -1,19 +1,21 @@
-package main
+package health_test
 
 import (
 	"runtime"
 	"testing"
+
+	"github.com/cesp99/infinite-jukebox/internal/health"
 )
 
 func TestHealthCheck_ReturnsPlatform(t *testing.T) {
-	hc := RunHealthCheck()
+	hc := health.Run()
 	if hc.Checked != runtime.GOOS {
 		t.Errorf("Checked = %q, want %q", hc.Checked, runtime.GOOS)
 	}
 }
 
 func TestLinuxFixHint_PicksAPackageManager(t *testing.T) {
-	hint := linuxFixHint()
+	hint := health.LinuxFixHint()
 	if hint == "" {
 		t.Error("empty hint")
 	}

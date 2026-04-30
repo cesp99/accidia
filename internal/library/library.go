@@ -1,4 +1,6 @@
-package main
+// Package library scans the user's music folder, extracts tags and cover
+// art, and serves decoded audio to the frontend via the MediaStore.
+package library
 
 import (
 	"bytes"
@@ -16,6 +18,18 @@ import (
 
 	"github.com/dhowden/tag"
 	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
+
+	"github.com/cesp99/infinite-jukebox/internal/audio"
+	"github.com/cesp99/infinite-jukebox/internal/ffmpeg"
+	"github.com/cesp99/infinite-jukebox/internal/media"
+	"github.com/cesp99/infinite-jukebox/internal/store"
+)
+
+// Re-export store types so callers importing `library` don't have to
+// also import `store` just to handle its output types.
+type (
+	Track             = store.Track
+	LibraryScanResult = store.LibraryScanResult
 )
 
 // audioExts lists the file extensions we treat as music. Lower-case.
@@ -46,34 +60,9 @@ var audioExts = map[string]struct{}{
 	".tta":  {},
 }
 
-// Track is a single audio file as known to the library.
-type Track struct {
-	Path        string `json:"path"`
-	Title       string `json:"title"`
-	Artist      string `json:"artist"`
-	Album       string `json:"album"`
-	AlbumArtist string `json:"albumArtist,omitempty"`
-	Genre       string `json:"genre,omitempty"`
-	Year        int    `json:"year,omitempty"`
-	TrackNumber int    `json:"trackNumber,omitempty"`
-	DiscNumber  int    `json:"discNumber,omitempty"`
-	Duration    int    `json:"duration,omitempty"`         // seconds, best-effort
-	Format      string `json:"format,omitempty"`           // "MP3", "FLAC", ...
-	Size        int64  `json:"size"`
-	ModTime     int64  `json:"modTime"`
-	HasCoverArt bool   `json:"hasCoverArt"`
-}
-
-// LibraryScanResult is what we hand back to the frontend after a scan.
-type LibraryScanResult struct {
-	Root       string  `json:"root"`
-	Tracks     []Track `json:"tracks"`
-	ScannedAt  int64   `json:"scannedAt"`
-	TotalFiles int     `json:"totalFiles"`
-}
-
 // TrackPayload bundles the raw audio bytes (base64) with the resolved
-// title for the frontend's Web Audio decoder.
+// title for the frontend's Web Audio decoder. Rarely used — prefer
+// DecodeTrack which returns int16 PCM over HTTP instead.
 type TrackPayload struct {
 	Path     string `json:"path"`
 	Title    string `json:"title"`
@@ -83,20 +72,46 @@ type TrackPayload struct {
 	DataB64  string `json:"dataB64"`
 }
 
+// DecodedAudio describes the result of decoding an audio file into PCM.
+//
+// The actual PCM bytes are served over HTTP via the MediaStore — embedding
+// tens of megabytes in this struct would choke the JSON IPC bridge, and
+// WebKit2GTK's `decodeAudioData` is flaky even on perfectly valid WAVs.
+// The frontend fetches `MediaURL`, wraps the bytes in an `Int16Array`, and
+// builds an `AudioBuffer` manually via `createBuffer` + `copyToChannel`,
+// which sidesteps the platform's audio-decoder entirely.
+type DecodedAudio struct {
+	Path       string  `json:"path"`
+	Title      string  `json:"title"`
+	Artist     string  `json:"artist"`
+	Album      string  `json:"album"`
+	Duration   float64 `json:"duration"`
+	SampleRate int     `json:"sampleRate"`
+	Channels   int     `json:"channels"`
+	// Frames is the number of audio frames per channel. `len(pcm) == Frames * Channels`.
+	Frames int `json:"frames"`
+	// MimeType of the body served at MediaURL.
+	MimeType string `json:"mimeType"`
+	// MediaURL points at interleaved little-endian int16 PCM bytes served
+	// by MediaStore. Example: "/media/a1b2c3…". Lifetime is bounded by the
+	// MediaStore LRU — the frontend should fetch promptly.
+	MediaURL string `json:"mediaUrl"`
+}
+
 // Library is the long-lived service that scans, caches, and serves audio
 // files from disk. It's safe for concurrent use.
 type Library struct {
-	store  *Store
-	ffmpeg *FFmpegService
-	media  *MediaStore
+	store  *store.Store
+	ffmpeg *ffmpeg.Service
+	media  *media.Store
 
 	mu  sync.RWMutex
 	ctx context.Context
 }
 
-// NewLibrary builds a Library backed by the given persistent Store.
-func NewLibrary(store *Store, ffmpeg *FFmpegService, media *MediaStore) *Library {
-	return &Library{store: store, ffmpeg: ffmpeg, media: media}
+// New builds a Library backed by the given subsystems.
+func New(st *store.Store, ff *ffmpeg.Service, md *media.Store) *Library {
+	return &Library{store: st, ffmpeg: ff, media: md}
 }
 
 // AttachContext stores the Wails context so we can emit progress events.
@@ -366,13 +381,13 @@ func (l *Library) DecodeTrack(path string) (DecodedAudio, error) {
 		samples []int16
 	)
 
-	sr, ch, samples, err := decodeTrack(path)
+	sr, ch, samples, err := audio.DecodeTrack(path)
 	switch {
 	case err == nil:
 		// Native Go path (MP3/FLAC/OGG/WAV).
 		logf("native decode ok: sr=%d ch=%d samples=%d", sr, ch, len(samples))
 
-	case errors.Is(err, errNeedsFFmpeg):
+	case errors.Is(err, audio.ErrNeedsFFmpeg):
 		if l.ffmpeg == nil {
 			return DecodedAudio{}, fmt.Errorf("ffmpeg-required: no ffmpeg service configured")
 		}
@@ -387,7 +402,7 @@ func (l *Library) DecodeTrack(path string) (DecodedAudio, error) {
 			return DecodedAudio{}, fmt.Errorf("ffmpeg decode failed: %w", derr)
 		}
 		logf("ffmpeg produced %d WAV bytes", len(wavBytes))
-		sr2, ch2, pcm, werr := decodeWAVBytes(wavBytes)
+		sr2, ch2, pcm, werr := audio.DecodeWAVBytes(wavBytes)
 		if werr != nil {
 			warnf("parsing ffmpeg WAV failed: %v", werr)
 			return DecodedAudio{}, fmt.Errorf("parse ffmpeg output: %w", werr)
@@ -407,7 +422,7 @@ func (l *Library) DecodeTrack(path string) (DecodedAudio, error) {
 	duration := float64(frames) / float64(sr)
 
 	// Serialise to little-endian bytes and push to the media store.
-	pcmBytes := pcmToLittleEndianBytes(samples)
+	pcmBytes := audio.PCMToLittleEndianBytes(samples)
 	mediaURL, err := l.media.Put("application/octet-stream", pcmBytes)
 	if err != nil {
 		return DecodedAudio{}, fmt.Errorf("media store: %w", err)

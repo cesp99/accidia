@@ -282,13 +282,41 @@ export function useAudioEngine() {
           source instanceof ArrayBuffer ? source.slice(0) : await source.arrayBuffer();
         buffer = await ctx.decodeAudioData(arrayBuffer);
       }
-      audioBufferRef.current = buffer;
 
+      // We're loading a new track — tear down any in-flight source from
+      // the previous one and reset the playback cursor so the next
+      // play()/playFrom() call starts from the top.
+      stopCurrentSource(false);
+      cancelAnimationFrame(animFrameRef.current);
+      startOffsetRef.current = 0;
+      lastJumpAudioTimeRef.current = -Infinity;
+      lastLoopContextTimeRef.current = null;
+      updateState({
+        currentBeat: 0,
+        currentTime: 0,
+        playedSeconds: 0,
+        jumpCount: 0,
+        lastJump: null,
+      });
+
+      audioBufferRef.current = buffer;
       beatsRef.current = analysisData.beats;
       jumpMapRef.current = buildJumpMap(analysisData.beats, analysisData.edges);
     },
-    [ensureContext],
+    [ensureContext, stopCurrentSource, updateState],
   );
+
+  /**
+   * Replace the beat grid + jump map without touching the currently
+   * loaded AudioBuffer. Used by the progressive-load path — we start
+   * playback with a minimal analysis (evenly-spaced beats, no edges)
+   * and swap in the real analysis once the heavy beat-detection
+   * finishes in the background.
+   */
+  const updateAnalysis = useCallback((analysisData: AnalysisData) => {
+    beatsRef.current = analysisData.beats;
+    jumpMapRef.current = buildJumpMap(analysisData.beats, analysisData.edges);
+  }, []);
 
   // Exposes the engine's AudioContext so callers can manually build
   // AudioBuffers from raw PCM and pass them to loadAudio without a
@@ -413,6 +441,7 @@ export function useAudioEngine() {
 
   return {
     loadAudio,
+    updateAnalysis,
     getContext,
     play,
     pause,

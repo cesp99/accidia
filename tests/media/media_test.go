@@ -1,4 +1,4 @@
-package main
+package media_test
 
 import (
 	"bytes"
@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/cesp99/infinite-jukebox/internal/media"
 )
 
 func TestMediaStore_PutAndServe(t *testing.T) {
-	store := NewMediaStore(3)
+	store := media.New(3)
 	body := []byte("RIFF\x00\x00\x00\x00WAVEfmt payload")
 	url, err := store.Put("audio/wav", body)
 	if err != nil {
@@ -39,7 +41,7 @@ func TestMediaStore_PutAndServe(t *testing.T) {
 }
 
 func TestMediaStore_HeadRequest(t *testing.T) {
-	store := NewMediaStore(3)
+	store := media.New(3)
 	body := make([]byte, 1024)
 	url, _ := store.Put("audio/wav", body)
 
@@ -63,7 +65,7 @@ func TestMediaStore_HeadRequest(t *testing.T) {
 }
 
 func TestMediaStore_LRUEviction(t *testing.T) {
-	store := NewMediaStore(2)
+	store := media.New(2)
 	url1, _ := store.Put("audio/wav", []byte("one"))
 	url2, _ := store.Put("audio/wav", []byte("two"))
 	url3, _ := store.Put("audio/wav", []byte("three"))
@@ -86,7 +88,7 @@ func TestMediaStore_LRUEviction(t *testing.T) {
 }
 
 func TestMediaStore_NotFound(t *testing.T) {
-	store := NewMediaStore(3)
+	store := media.New(3)
 	req := httptest.NewRequest(http.MethodGet, "/media/bogus-token", nil)
 	w := httptest.NewRecorder()
 	store.ServeHTTP(w, req)
@@ -96,7 +98,7 @@ func TestMediaStore_NotFound(t *testing.T) {
 }
 
 func TestMediaStore_IgnoresNonMediaPaths(t *testing.T) {
-	store := NewMediaStore(3)
+	store := media.New(3)
 	// Paths that don't start with /media/ should 404 (they would normally
 	// be served by the asset server's embedded assets; we only handle
 	// /media/).

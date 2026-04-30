@@ -1,4 +1,7 @@
-package main
+// Package store persists long-lived user state — settings, the cached
+// library index, and exposes the platform-specific user config directory
+// used by sibling packages (lyrics disk cache, collection JSON, etc.).
+package store
 
 import (
 	"encoding/json"
@@ -18,6 +21,34 @@ type Settings struct {
 	LastTrackPath   string  `json:"lastTrackPath,omitempty"`
 	WindowWidth     int     `json:"windowWidth,omitempty"`
 	WindowHeight    int     `json:"windowHeight,omitempty"`
+}
+
+// LibraryScanResult is the cached library index. Kept in this package
+// (rather than internal/library) so the store can marshal/unmarshal
+// without a dep cycle.
+type LibraryScanResult struct {
+	Root       string  `json:"root"`
+	Tracks     []Track `json:"tracks"`
+	ScannedAt  int64   `json:"scannedAt"`
+	TotalFiles int     `json:"totalFiles"`
+}
+
+// Track is a single audio file as known to the library.
+type Track struct {
+	Path        string `json:"path"`
+	Title       string `json:"title"`
+	Artist      string `json:"artist"`
+	Album       string `json:"album"`
+	AlbumArtist string `json:"albumArtist,omitempty"`
+	Genre       string `json:"genre,omitempty"`
+	Year        int    `json:"year,omitempty"`
+	TrackNumber int    `json:"trackNumber,omitempty"`
+	DiscNumber  int    `json:"discNumber,omitempty"`
+	Duration    int    `json:"duration,omitempty"` // seconds, best-effort
+	Format      string `json:"format,omitempty"`   // "MP3", "FLAC", ...
+	Size        int64  `json:"size"`
+	ModTime     int64  `json:"modTime"`
+	HasCoverArt bool   `json:"hasCoverArt"`
 }
 
 // defaultSettings is what we fall back to on a fresh install.
@@ -43,15 +74,15 @@ type Store struct {
 	library  *LibraryScanResult
 }
 
-// NewStore returns an unitialised store. Call Init() before using it.
-func NewStore() *Store {
+// New returns an uninitialised store. Call Init() before using it.
+func New() *Store {
 	return &Store{settings: defaultSettings()}
 }
 
 // Init resolves the user's app data directory and loads any existing
 // settings/library cache. Missing files are not errors.
 func (s *Store) Init() error {
-	dir, err := userConfigDir("Accidia")
+	dir, err := UserConfigDir("Accidia")
 	if err != nil {
 		return fmt.Errorf("user config dir: %w", err)
 	}
@@ -188,11 +219,15 @@ func writeJSON(path string, v any) error {
 	return os.Rename(tmp, path)
 }
 
-// userConfigDir returns the per-user config directory for our app:
-//   - Linux:   $XDG_CONFIG_HOME/Accidia or ~/.config/Accidia
-//   - macOS:   ~/Library/Application Support/Accidia
-//   - Windows: %APPDATA%/Accidia
-func userConfigDir(name string) (string, error) {
+// UserConfigDir returns the per-user config directory for our app:
+//   - Linux:   $XDG_CONFIG_HOME/<name> or ~/.config/<name>
+//   - macOS:   ~/Library/Application Support/<name>
+//   - Windows: %APPDATA%/<name>
+//
+// Exported because sibling packages (lyrics cache, collection store)
+// need to land in the same place without duplicating the OS-specific
+// path logic.
+func UserConfigDir(name string) (string, error) {
 	base, err := os.UserConfigDir()
 	if err != nil {
 		return "", err

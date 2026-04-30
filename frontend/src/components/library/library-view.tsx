@@ -8,11 +8,21 @@ import {
   ScanLibrary,
 } from "../../../wailsjs/go/main/App";
 import { EventsOn } from "../../../wailsjs/runtime/runtime";
-import type { main } from "../../../wailsjs/go/models";
+import type { store } from "../../../wailsjs/go/models";
+import type { Playlist } from "@/hooks/use-playlists";
 
 interface LibraryViewProps {
   currentPath?: string;
-  onPlay: (track: main.Track) => void;
+  onPlay: (track: store.Track, albumTracks: store.Track[], albumLabel: string) => void;
+  onPlayNext: (tracks: store.Track[]) => void;
+  onAddToQueue: (tracks: store.Track[]) => void;
+  isFavorite: (path: string) => boolean;
+  onToggleFavorite: (path: string) => void;
+  playlists: Playlist[];
+  onAddToPlaylist: (playlistId: string, paths: string[]) => void;
+  onCreatePlaylistWithTracks: (paths: string[]) => void;
+  /** Hoisted so parent components can join against favorites / playlists. */
+  onLibraryLoad?: (library: store.LibraryScanResult) => void;
 }
 
 interface ScanProgress {
@@ -21,8 +31,19 @@ interface ScanProgress {
   total: number;
 }
 
-export function LibraryView({ currentPath, onPlay }: LibraryViewProps) {
-  const [library, setLibrary] = useState<main.LibraryScanResult | null>(null);
+export function LibraryView({
+  currentPath,
+  onPlay,
+  onPlayNext,
+  onAddToQueue,
+  isFavorite,
+  onToggleFavorite,
+  playlists,
+  onAddToPlaylist,
+  onCreatePlaylistWithTracks,
+  onLibraryLoad,
+}: LibraryViewProps) {
+  const [library, setLibrary] = useState<store.LibraryScanResult | null>(null);
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState<ScanProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -30,8 +51,13 @@ export function LibraryView({ currentPath, onPlay }: LibraryViewProps) {
   // Initial load: pull whatever's cached on disk so the UI fills instantly.
   useEffect(() => {
     GetLibrary()
-      .then((res) => setLibrary(res))
+      .then((res) => {
+        setLibrary(res);
+        onLibraryLoad?.(res);
+      })
       .catch((e) => setError(String(e)));
+    // onLibraryLoad is expected to be stable; only fire on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Subscribe to scan progress events emitted by Go's library scanner.
@@ -50,6 +76,7 @@ export function LibraryView({ currentPath, onPlay }: LibraryViewProps) {
       setScanning(true);
       const result = await ScanLibrary(path);
       setLibrary(result);
+      onLibraryLoad?.(result);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -65,6 +92,7 @@ export function LibraryView({ currentPath, onPlay }: LibraryViewProps) {
     try {
       const result = await ScanLibrary(library.root);
       setLibrary(result);
+      onLibraryLoad?.(result);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -122,12 +150,21 @@ export function LibraryView({ currentPath, onPlay }: LibraryViewProps) {
           </button>
         </div>
       </div>
-      {scanning && progress && (
-        <ScanBar progress={progress} />
-      )}
+      {scanning && progress && <ScanBar progress={progress} />}
       {error && <p className="px-6 pt-2 text-xs text-destructive">{error}</p>}
       <div className="min-h-0 flex-1">
-        <TrackList tracks={tracks} currentPath={currentPath} onPlay={onPlay} />
+        <TrackList
+          tracks={tracks}
+          currentPath={currentPath}
+          onPlay={onPlay}
+          onPlayNext={onPlayNext}
+          onAddToQueue={onAddToQueue}
+          isFavorite={isFavorite}
+          onToggleFavorite={onToggleFavorite}
+          playlists={playlists}
+          onAddToPlaylist={onAddToPlaylist}
+          onCreatePlaylistWithTracks={onCreatePlaylistWithTracks}
+        />
       </div>
     </div>
   );

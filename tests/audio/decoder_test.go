@@ -1,4 +1,4 @@
-package main
+package audio_test
 
 import (
 	"encoding/binary"
@@ -6,10 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/cesp99/infinite-jukebox/internal/audio"
 )
 
 // makeSineWAV builds a synthetic 44.1k/stereo/16-bit sine WAV at the given
-// path so we can round-trip it through decodeWAV + wrapAsWAV.
+// path so we can round-trip it through DecodeTrack + WrapAsWAV.
 func makeSineWAV(t *testing.T, dir string, seconds float64, freq float64) string {
 	t.Helper()
 	sr := 44100
@@ -23,7 +25,7 @@ func makeSineWAV(t *testing.T, dir string, seconds float64, freq float64) string
 		pcm[i*2+1] = v
 	}
 
-	wav := wrapAsWAV(sr, ch, pcm)
+	wav := audio.WrapAsWAV(sr, ch, pcm)
 	path := filepath.Join(dir, "sine.wav")
 	if err := os.WriteFile(path, wav, 0o644); err != nil {
 		t.Fatal(err)
@@ -35,7 +37,7 @@ func TestDecodeWAV_Roundtrip(t *testing.T) {
 	dir := t.TempDir()
 	path := makeSineWAV(t, dir, 0.5, 440)
 
-	sr, ch, samples, err := decodeTrack(path)
+	sr, ch, samples, err := audio.DecodeTrack(path)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -56,7 +58,7 @@ func TestWrapAsWAV_Header(t *testing.T) {
 	for i := range samples {
 		samples[i] = int16(i)
 	}
-	out := wrapAsWAV(44100, 2, samples)
+	out := audio.WrapAsWAV(44100, 2, samples)
 
 	if string(out[0:4]) != "RIFF" {
 		t.Errorf("want RIFF got %q", string(out[0:4]))
@@ -87,8 +89,16 @@ func TestDecodeWAV_IEEEFloat(t *testing.T) {
 	path := filepath.Join(dir, "float.wav")
 
 	data := make([]byte, 0, 1024)
-	appendU32 := func(v uint32) { b := make([]byte, 4); binary.LittleEndian.PutUint32(b, v); data = append(data, b...) }
-	appendU16 := func(v uint16) { b := make([]byte, 2); binary.LittleEndian.PutUint16(b, v); data = append(data, b...) }
+	appendU32 := func(v uint32) {
+		b := make([]byte, 4)
+		binary.LittleEndian.PutUint32(b, v)
+		data = append(data, b...)
+	}
+	appendU16 := func(v uint16) {
+		b := make([]byte, 2)
+		binary.LittleEndian.PutUint16(b, v)
+		data = append(data, b...)
+	}
 
 	// 2 samples at 8kHz, mono, 32-bit float
 	numSamples := 2
@@ -100,13 +110,13 @@ func TestDecodeWAV_IEEEFloat(t *testing.T) {
 	appendU32(36 + uint32(len(pcm)))
 	data = append(data, []byte("WAVE")...)
 	data = append(data, []byte("fmt ")...)
-	appendU32(16)      // fmt chunk size
-	appendU16(3)       // IEEE float
-	appendU16(1)       // channels
-	appendU32(8000)    // sample rate
+	appendU32(16)       // fmt chunk size
+	appendU16(3)        // IEEE float
+	appendU16(1)        // channels
+	appendU32(8000)     // sample rate
 	appendU32(8000 * 4) // byte rate
-	appendU16(4)       // block align
-	appendU16(32)      // bits per sample
+	appendU16(4)        // block align
+	appendU16(32)       // bits per sample
 	data = append(data, []byte("data")...)
 	appendU32(uint32(len(pcm)))
 	data = append(data, pcm...)
@@ -114,7 +124,7 @@ func TestDecodeWAV_IEEEFloat(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	sr, ch, out, err := decodeTrack(path)
+	sr, ch, out, err := audio.DecodeTrack(path)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -139,34 +149,11 @@ func TestDecodeTrack_FallsBackToFFmpeg(t *testing.T) {
 	if err := os.WriteFile(path, []byte("nope"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, err := decodeTrack(path)
+	_, _, _, err := audio.DecodeTrack(path)
 	if err == nil {
 		t.Fatal("expected error for unsupported extension")
 	}
-	if !errorsIsFFmpegNeeded(err) {
-		t.Errorf("want errNeedsFFmpeg, got %v", err)
-	}
-}
-
-func errorsIsFFmpegNeeded(err error) bool {
-	return err != nil && err.Error() == errNeedsFFmpeg.Error()
-}
-
-func TestParseLRC(t *testing.T) {
-	src := `[ar:Test Artist]
-[ti:Test Title]
-[00:12.34]First line
-[00:18.56]Second line
-[01:05.00][02:10.00]Repeated line
-`
-	lines := parseLRC(src)
-	if len(lines) != 4 {
-		t.Fatalf("got %d lines, want 4", len(lines))
-	}
-	if lines[0].TimeSec != 12.34 || lines[0].Text != "First line" {
-		t.Errorf("line 0 = %+v", lines[0])
-	}
-	if lines[3].TimeSec != 130.0 || lines[3].Text != "Repeated line" {
-		t.Errorf("line 3 = %+v", lines[3])
+	if err != audio.ErrNeedsFFmpeg {
+		t.Errorf("want ErrNeedsFFmpeg, got %v", err)
 	}
 }

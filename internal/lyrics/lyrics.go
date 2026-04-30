@@ -1,29 +1,38 @@
-package main
+// Package lyrics fetches time-synced lyrics from LRCLIB (<https://lrclib.net>),
+// a free CC0-licensed database, with a two-tier (memory + disk) cache
+// so we don't re-hit the network across app restarts.
+package lyrics
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cesp99/infinite-jukebox/internal/store"
 )
 
 // Lyrics is the structured payload we send back to the frontend.
 // If `SyncedLines` is non-empty the UI renders time-synced lyrics; otherwise
 // it falls back to `Plain` for a static display.
 type Lyrics struct {
-	TrackID     int          `json:"trackId"`
-	Source      string       `json:"source"`              // always "lrclib" today
-	Instrumental bool        `json:"instrumental"`
-	Plain       string       `json:"plain,omitempty"`
-	SyncedLines []SyncedLine `json:"syncedLines,omitempty"`
+	TrackID      int          `json:"trackId"`
+	Source       string       `json:"source"` // always "lrclib" today
+	Instrumental bool         `json:"instrumental"`
+	Plain        string       `json:"plain,omitempty"`
+	SyncedLines  []SyncedLine `json:"syncedLines,omitempty"`
 }
 
 // SyncedLine is a single `[mm:ss.xx]text` entry from an LRC file.
@@ -32,33 +41,63 @@ type SyncedLine struct {
 	Text    string  `json:"text"`
 }
 
-// LyricsService wraps the LRCLIB (<https://lrclib.net>) API. LRCLIB is a free,
-// CC0-licensed public database of user-contributed lyrics (both plain and
-// `.lrc` time-synced). No API key required.
-//
-// The service keeps a small in-memory cache keyed on (title|artist|album)
-// so moving between views doesn't retrigger a network fetch.
-type LyricsService struct {
-	client *http.Client
+// Service wraps the LRCLIB API with a two-tier cache:
+//   - An in-memory map keyed on (title|artist|album) so moving between views
+//     doesn't hit the filesystem.
+//   - A per-key JSON file on disk so restarts don't re-hit the network. A
+//     miss is cached for 7 days (so we retry later in case the track gets
+//     added); a hit is cached for 90 days.
+type Service struct {
+	client    *http.Client
 	userAgent string
 
-	mu    sync.Mutex
-	cache map[string]Lyrics
+	mu       sync.Mutex
+	cache    map[string]Lyrics
+	cacheDir string
 }
 
-// NewLyricsService returns an initialised lyrics service.
-func NewLyricsService() *LyricsService {
-	return &LyricsService{
-		client: &http.Client{Timeout: 10 * time.Second},
+// diskCacheEntry is what we persist to disk. We wrap the lyrics payload
+// with a timestamp + miss flag so we can expire old misses without
+// forcing a retry on every launch.
+type diskCacheEntry struct {
+	SavedAt int64  `json:"savedAt"`
+	Miss    bool   `json:"miss"`
+	Payload Lyrics `json:"payload"`
+}
+
+const (
+	hitTTL  = 90 * 24 * time.Hour
+	missTTL = 7 * 24 * time.Hour
+)
+
+// NewService returns an initialised lyrics service with its disk cache
+// rooted at the user's app data directory. The cache directory is
+// created lazily on first write.
+func NewService() *Service {
+	s := &Service{
+		client:    &http.Client{Timeout: 10 * time.Second},
 		userAgent: "Accidia/0.1 (https://github.com/cesp99)",
-		cache: make(map[string]Lyrics),
+		cache:     make(map[string]Lyrics),
 	}
+	if base, err := store.UserConfigDir("Accidia"); err == nil {
+		s.cacheDir = filepath.Join(base, "lyrics-cache")
+	}
+	return s
+}
+
+// WithCacheDir pins the on-disk cache directory, primarily for tests
+// that want a hermetic location.
+func (s *Service) WithCacheDir(dir string) *Service {
+	s.mu.Lock()
+	s.cacheDir = dir
+	s.mu.Unlock()
+	return s
 }
 
 // Get resolves lyrics for a track. Returns an empty Lyrics{} (no error) if
 // the track simply isn't in the database — that's the common case, not a
 // failure condition.
-func (s *LyricsService) Get(ctx context.Context, title, artist, album string, duration float64) (Lyrics, error) {
+func (s *Service) Get(ctx context.Context, title, artist, album string, duration float64) (Lyrics, error) {
 	title = strings.TrimSpace(title)
 	artist = strings.TrimSpace(artist)
 	album = strings.TrimSpace(album)
@@ -67,6 +106,7 @@ func (s *LyricsService) Get(ctx context.Context, title, artist, album string, du
 	}
 
 	key := cacheKey(title, artist, album)
+	// Tier 1 — in-memory cache.
 	s.mu.Lock()
 	cached, ok := s.cache[key]
 	s.mu.Unlock()
@@ -74,9 +114,15 @@ func (s *LyricsService) Get(ctx context.Context, title, artist, album string, du
 		return cached, nil
 	}
 
-	// LRCLIB exposes a `get` endpoint that, given title/artist/album/duration,
-	// returns the best-match row. Duration helps disambiguate live vs. studio
-	// versions. `duration` is optional — if unknown we just omit it.
+	// Tier 2 — disk cache. Populate the in-memory cache if hit.
+	if l, ok := s.loadFromDisk(key); ok {
+		s.mu.Lock()
+		s.cache[key] = l
+		s.mu.Unlock()
+		return l, nil
+	}
+
+	// Cache miss at both tiers — go to the network.
 	q := url.Values{}
 	q.Set("track_name", title)
 	q.Set("artist_name", artist)
@@ -84,7 +130,7 @@ func (s *LyricsService) Get(ctx context.Context, title, artist, album string, du
 		q.Set("album_name", album)
 	}
 	if duration > 0 {
-		q.Set("duration", strconv.Itoa(int(duration + 0.5)))
+		q.Set("duration", strconv.Itoa(int(duration+0.5)))
 	}
 	endpoint := "https://lrclib.net/api/get?" + q.Encode()
 
@@ -105,12 +151,13 @@ func (s *LyricsService) Get(ctx context.Context, title, artist, album string, du
 		// Try the /api/search fallback which does a fuzzier match.
 		searched, err := s.search(ctx, title, artist, album)
 		if err == nil && searched.TrackID != 0 {
-			s.cacheSet(key, searched)
+			s.cacheSet(key, searched, false)
 			return searched, nil
 		}
 		// Still empty — cache the miss so we don't hammer the API.
-		s.cacheSet(key, Lyrics{Source: "lrclib"})
-		return Lyrics{Source: "lrclib"}, nil
+		miss := Lyrics{Source: "lrclib"}
+		s.cacheSet(key, miss, true)
+		return miss, nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		return Lyrics{}, fmt.Errorf("lrclib: status %d", resp.StatusCode)
@@ -124,13 +171,13 @@ func (s *LyricsService) Get(ctx context.Context, title, artist, album string, du
 	if err != nil {
 		return Lyrics{}, err
 	}
-	s.cacheSet(key, out)
+	s.cacheSet(key, out, out.TrackID == 0 && out.Plain == "" && len(out.SyncedLines) == 0 && !out.Instrumental)
 	return out, nil
 }
 
 // search is the /api/search fallback used when the exact-match /api/get 404s.
 // It returns the best-scored hit (LRCLIB orders by relevance server-side).
-func (s *LyricsService) search(ctx context.Context, title, artist, album string) (Lyrics, error) {
+func (s *Service) search(ctx context.Context, title, artist, album string) (Lyrics, error) {
 	q := url.Values{}
 	q.Set("track_name", title)
 	q.Set("artist_name", artist)
@@ -169,10 +216,94 @@ func (s *LyricsService) search(ctx context.Context, title, artist, album string)
 	return parseLrcLibResponse(arr[0])
 }
 
-func (s *LyricsService) cacheSet(key string, l Lyrics) {
+// cacheSet writes to the in-memory cache and mirrors the entry to disk.
+// `miss` should be true for negative cache entries so we can expire them
+// sooner than actual hits.
+func (s *Service) cacheSet(key string, l Lyrics, miss bool) {
 	s.mu.Lock()
 	s.cache[key] = l
 	s.mu.Unlock()
+	s.saveToDisk(key, l, miss)
+}
+
+// diskCachePath returns the on-disk JSON path for a given cache key.
+// The key is SHA-1'd so we don't need to worry about path-hostile chars
+// in track names (the cache key already lower-cases + strips, but slashes
+// in titles are legal).
+func (s *Service) diskCachePath(key string) string {
+	s.mu.Lock()
+	dir := s.cacheDir
+	s.mu.Unlock()
+	if dir == "" {
+		return ""
+	}
+	sum := sha1.Sum([]byte(key))
+	return filepath.Join(dir, hex.EncodeToString(sum[:])+".json")
+}
+
+// loadFromDisk tries to read a cached entry for this key. Returns
+// (Lyrics, true) only on a live (non-expired) cache entry; any read or
+// decode error is swallowed silently so we'll just go to the network.
+func (s *Service) loadFromDisk(key string) (Lyrics, bool) {
+	path := s.diskCachePath(key)
+	if path == "" {
+		return Lyrics{}, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Lyrics{}, false
+	}
+	var entry diskCacheEntry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return Lyrics{}, false
+	}
+	// Legacy payloads written before we introduced the wrapper — if
+	// nothing unmarshalled into SavedAt, treat them as a raw Lyrics.
+	if entry.SavedAt == 0 {
+		var raw Lyrics
+		if err := json.Unmarshal(data, &raw); err == nil && (raw.Source != "" || raw.Plain != "" || len(raw.SyncedLines) > 0) {
+			return raw, true
+		}
+		return Lyrics{}, false
+	}
+	saved := time.Unix(entry.SavedAt, 0)
+	ttl := hitTTL
+	if entry.Miss {
+		ttl = missTTL
+	}
+	if time.Since(saved) > ttl {
+		// Stale — let the caller refetch. We leave the file in place;
+		// saveToDisk will overwrite on the next successful lookup.
+		return Lyrics{}, false
+	}
+	return entry.Payload, true
+}
+
+// saveToDisk writes the cache entry to disk, best-effort. Errors are
+// logged to stderr at most and never surfaced to the caller — a failed
+// disk write just means we'll retry on next launch.
+func (s *Service) saveToDisk(key string, l Lyrics, miss bool) {
+	path := s.diskCachePath(key)
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	entry := diskCacheEntry{
+		SavedAt: time.Now().Unix(),
+		Miss:    miss,
+		Payload: l,
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
 }
 
 // cacheKey normalises input so that "Song " and "song" hit the same entry.
@@ -208,7 +339,7 @@ func parseLrcLibResponse(body []byte) (Lyrics, error) {
 		Plain:        row.PlainLyrics,
 	}
 	if strings.TrimSpace(row.SyncedLyrics) != "" {
-		out.SyncedLines = parseLRC(row.SyncedLyrics)
+		out.SyncedLines = ParseLRC(row.SyncedLyrics)
 	}
 	return out, nil
 }
@@ -218,9 +349,10 @@ func parseLrcLibResponse(body []byte) (Lyrics, error) {
 // all of them and fan the line out.
 var timestampPattern = regexp.MustCompile(`\[(\d+):(\d+(?:\.\d+)?)\]`)
 
-// parseLRC turns a classic `.lrc` blob into a sorted slice of SyncedLine{}.
+// ParseLRC turns a classic `.lrc` blob into a sorted slice of SyncedLine{}.
 // Lines without timestamps (metadata like `[ar:Artist]`) are skipped.
-func parseLRC(src string) []SyncedLine {
+// Exported so tests can exercise it directly.
+func ParseLRC(src string) []SyncedLine {
 	lines := strings.Split(src, "\n")
 	out := make([]SyncedLine, 0, len(lines))
 

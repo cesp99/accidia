@@ -1,11 +1,13 @@
 //go:build integration
 
-package main
+package audio_test
 
 import (
 	"os"
 	"os/exec"
 	"testing"
+
+	"github.com/cesp99/infinite-jukebox/internal/audio"
 )
 
 // TestWriteGoWAVToDisk saves a Go-produced WAV to /tmp so we can probe it
@@ -21,11 +23,11 @@ func TestWriteGoWAVToDisk(t *testing.T) {
 			t.Skipf("ffmpeg gen: %v", err)
 		}
 	}
-	sr, ch, samples, err := decodeTrack(mp3)
+	sr, ch, samples, err := audio.DecodeTrack(mp3)
 	if err != nil {
-		t.Fatalf("decodeTrack: %v", err)
+		t.Fatalf("DecodeTrack: %v", err)
 	}
-	wav := wrapAsWAV(sr, ch, samples)
+	wav := audio.WrapAsWAV(sr, ch, samples)
 	out := "/tmp/accidia-go.wav"
 	if err := os.WriteFile(out, wav, 0o644); err != nil {
 		t.Fatal(err)

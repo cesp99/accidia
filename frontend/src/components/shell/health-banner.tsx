@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { AlertTriangle, X, Copy } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { RunHealthCheck } from "../../../wailsjs/go/main/App";
-import type { main } from "../../../wailsjs/go/models";
+import type { health } from "../../../wailsjs/go/models";
 
 /**
  * A non-blocking startup banner that shows when the Go-side health check
@@ -12,7 +12,7 @@ import type { main } from "../../../wailsjs/go/models";
  * by default.
  */
 export function HealthBanner() {
-  const [hc, setHc] = useState<main.HealthCheck | null>(null);
+  const [hc, setHc] = useState<health.Check | null>(null);
   const [dismissed, setDismissed] = useState(false);
 
   useEffect(() => {

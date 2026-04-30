@@ -1,4 +1,11 @@
-package main
+// Package ffmpeg locates, downloads, caches, and invokes a static
+// ffmpeg binary for decoding long-tail audio formats (AAC, M4A, Opus,
+// WMA, ALAC, MKA, etc.) that our pure-Go decoders don't cover.
+//
+// Users never have to install ffmpeg manually — if we can't find one on
+// $PATH or in our cache, the frontend can trigger an on-demand download
+// via EnsureAvailable.
+package ffmpeg
 
 import (
 	"archive/tar"
@@ -19,11 +26,7 @@ import (
 	"github.com/ulikunitz/xz"
 )
 
-// FFmpegService locates, downloads, caches, and invokes a static ffmpeg binary.
-// Its sole purpose is to let us decode long-tail audio formats (AAC, M4A,
-// Opus, WMA, ALAC, MKA, etc.) without requiring the user to install
-// anything themselves.
-//
+// Service locates, downloads, caches, and invokes a static ffmpeg binary.
 // Lookup order:
 //  1. Cached path from a previous call
 //  2. A binary we previously downloaded into the app cache directory
@@ -31,7 +34,7 @@ import (
 //
 // If none of those succeed, the frontend can call EnsureAvailable() to
 // trigger an on-demand download with progress events.
-type FFmpegService struct {
+type Service struct {
 	mu      sync.Mutex
 	binPath string // cached result of Locate()
 
@@ -39,31 +42,38 @@ type FFmpegService struct {
 	// user's os-specific cache directory.
 	cacheDir string
 
-	// progress is the channel name for Wails events. Exposed so other
-	// packages can reuse the same name for the frontend listener.
+	// progressEvent is the channel name for Wails events.
 	progressEvent string
 }
 
-// NewFFmpegService returns a ready-to-use FFmpeg service. The actual
-// cache directory is resolved lazily on first Download() so constructors
-// stay side-effect-free.
-func NewFFmpegService() *FFmpegService {
-	return &FFmpegService{progressEvent: "ffmpeg:progress"}
+// New returns a ready-to-use service. The actual cache directory is
+// resolved lazily on first download so constructors stay side-effect-free.
+func New() *Service {
+	return &Service{progressEvent: "ffmpeg:progress"}
 }
 
-// FFmpegStatus is what we tell the frontend on demand.
-type FFmpegStatus struct {
+// WithCacheDir pins the cache directory — primarily used by tests that
+// want a predictable, hermetic location.
+func (f *Service) WithCacheDir(dir string) *Service {
+	f.mu.Lock()
+	f.cacheDir = dir
+	f.mu.Unlock()
+	return f
+}
+
+// Status is the structured payload we send to the frontend.
+type Status struct {
 	Available    bool   `json:"available"`
 	Path         string `json:"path,omitempty"`
-	Source       string `json:"source,omitempty"`  // "system" | "cache" | ""
-	Platform     string `json:"platform,omitempty"` // e.g. "linux/amd64"
+	Source       string `json:"source,omitempty"`       // "system" | "cache" | ""
+	Platform     string `json:"platform,omitempty"`     // e.g. "linux/amd64"
 	DownloadURL  string `json:"downloadUrl,omitempty"`
 	DownloadSize int64  `json:"downloadSize,omitempty"` // approximate, bytes
 }
 
-// Status returns the current availability of ffmpeg without downloading.
-func (f *FFmpegService) Status() FFmpegStatus {
-	s := FFmpegStatus{
+// GetStatus returns the current availability of ffmpeg without downloading.
+func (f *Service) GetStatus() Status {
+	s := Status{
 		Platform: runtime.GOOS + "/" + runtime.GOARCH,
 	}
 	if path, source, err := f.locate(); err == nil {
@@ -71,7 +81,7 @@ func (f *FFmpegService) Status() FFmpegStatus {
 		s.Path = path
 		s.Source = source
 	}
-	if url, err := ffmpegDownloadURL(); err == nil {
+	if url, err := DownloadURL(); err == nil {
 		s.DownloadURL = url
 		s.DownloadSize = 120 * 1024 * 1024 // rough upper bound; real size depends on platform
 	}
@@ -79,7 +89,7 @@ func (f *FFmpegService) Status() FFmpegStatus {
 }
 
 // locate is the internal lookup. Returns (path, source, err).
-func (f *FFmpegService) locate() (string, string, error) {
+func (f *Service) locate() (string, string, error) {
 	f.mu.Lock()
 	if f.binPath != "" {
 		if _, err := os.Stat(f.binPath); err == nil {
@@ -107,7 +117,7 @@ func (f *FFmpegService) locate() (string, string, error) {
 	return "", "", errors.New("ffmpeg not found")
 }
 
-func (f *FFmpegService) rememberPath(path string) {
+func (f *Service) rememberPath(path string) {
 	f.mu.Lock()
 	f.binPath = path
 	f.mu.Unlock()
@@ -115,7 +125,7 @@ func (f *FFmpegService) rememberPath(path string) {
 
 // Locate returns the currently usable ffmpeg path, or "" if none is
 // available. It never downloads — use EnsureAvailable for that.
-func (f *FFmpegService) Locate() (string, error) {
+func (f *Service) Locate() (string, error) {
 	p, _, err := f.locate()
 	return p, err
 }
@@ -124,14 +134,14 @@ func (f *FFmpegService) Locate() (string, error) {
 // build into the user's cache dir if neither the cached copy nor system
 // ffmpeg can be found. Progress callbacks receive (bytesReceived, bytesTotal).
 // For indeterminate downloads bytesTotal may be 0.
-func (f *FFmpegService) EnsureAvailable(ctx context.Context, progress func(got, total int64, stage string)) (string, error) {
+func (f *Service) EnsureAvailable(ctx context.Context, progress func(got, total int64, stage string)) (string, error) {
 	if path, _, err := f.locate(); err == nil {
 		return path, nil
 	}
 	if progress == nil {
 		progress = func(int64, int64, string) {}
 	}
-	url, err := ffmpegDownloadURL()
+	url, err := DownloadURL()
 	if err != nil {
 		return "", err
 	}
@@ -176,7 +186,7 @@ func (f *FFmpegService) EnsureAvailable(ctx context.Context, progress func(got, 
 // DecodeFile shells out to ffmpeg to decode `path` into a WAV byte slice.
 // The output is a complete RIFF/WAVE file — the caller can pipe it into
 // our existing WAV decoder or forward it to the frontend unchanged.
-func (f *FFmpegService) DecodeFile(ctx context.Context, path string) ([]byte, error) {
+func (f *Service) DecodeFile(ctx context.Context, path string) ([]byte, error) {
 	bin, err := f.Locate()
 	if err != nil {
 		return nil, err
@@ -206,7 +216,7 @@ func (f *FFmpegService) DecodeFile(ctx context.Context, path string) ([]byte, er
 // Platform plumbing
 // ---------------------------------------------------------------------------
 
-// ffmpegDownloadURL returns the canonical URL we fetch a static ffmpeg from
+// DownloadURL returns the canonical URL we fetch a static ffmpeg from
 // for the current platform. URLs stay stable across releases:
 //
 //   - Linux:  BtbN/FFmpeg-Builds "latest" tagged tarballs
@@ -215,7 +225,7 @@ func (f *FFmpegService) DecodeFile(ctx context.Context, path string) ([]byte, er
 //
 // These are all trusted, public, LGPL/GPL builds widely used by tools like
 // yt-dlp, HandBrake, and Audacity's portable distributions.
-func ffmpegDownloadURL() (string, error) {
+func DownloadURL() (string, error) {
 	switch runtime.GOOS {
 	case "linux":
 		switch runtime.GOARCH {
@@ -238,21 +248,28 @@ func ffmpegDownloadURL() (string, error) {
 // resolveCacheDir returns the cache directory we use for downloaded ffmpeg.
 // Prefers os.UserCacheDir() (XDG on Linux, Library/Caches on macOS,
 // LocalAppData on Windows) and nests under Accidia/.
-func (f *FFmpegService) resolveCacheDir() (string, error) {
+func (f *Service) resolveCacheDir() (string, error) {
+	f.mu.Lock()
 	if f.cacheDir != "" {
-		return f.cacheDir, nil
+		dir := f.cacheDir
+		f.mu.Unlock()
+		return dir, nil
 	}
+	f.mu.Unlock()
 	base, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
 	}
-	f.cacheDir = filepath.Join(base, "Accidia", "ffmpeg")
-	return f.cacheDir, nil
+	dir := filepath.Join(base, "Accidia", "ffmpeg")
+	f.mu.Lock()
+	f.cacheDir = dir
+	f.mu.Unlock()
+	return dir, nil
 }
 
 // cachedBin returns the path where we expect to find a previously-downloaded
 // ffmpeg binary (if one exists).
-func (f *FFmpegService) cachedBin() (string, error) {
+func (f *Service) cachedBin() (string, error) {
 	dir, err := f.resolveCacheDir()
 	if err != nil {
 		return "", err
@@ -307,7 +324,7 @@ func downloadWithProgress(ctx context.Context, url string, dst io.Writer, progre
 
 // extractArchive unpacks the downloaded archive and returns the path of the
 // extracted ffmpeg binary. Archive format is inferred from the URL.
-func (f *FFmpegService) extractArchive(archivePath, sourceURL, cacheDir string) (string, error) {
+func (f *Service) extractArchive(archivePath, sourceURL, cacheDir string) (string, error) {
 	binDir := filepath.Join(cacheDir, "bin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		return "", err
@@ -320,17 +337,18 @@ func (f *FFmpegService) extractArchive(archivePath, sourceURL, cacheDir string) 
 
 	switch {
 	case strings.HasSuffix(sourceURL, ".tar.xz"):
-		return target, extractTarXZ(archivePath, target)
+		return target, ExtractTarXZ(archivePath, target)
 	case strings.HasSuffix(sourceURL, ".zip"):
-		return target, extractZip(archivePath, target, targetName)
+		return target, ExtractZip(archivePath, target, targetName)
 	default:
 		return "", fmt.Errorf("unsupported archive format: %s", sourceURL)
 	}
 }
 
-// extractTarXZ pulls the first file named `ffmpeg` (matching the exact
-// basename) out of a .tar.xz archive and writes it to dst.
-func extractTarXZ(src, dst string) error {
+// ExtractTarXZ pulls the first file named `ffmpeg` (matching the exact
+// basename) out of a .tar.xz archive and writes it to dst. Exported so
+// tests can run it on fixture archives.
+func ExtractTarXZ(src, dst string) error {
 	f, err := os.Open(src)
 	if err != nil {
 		return err
@@ -368,9 +386,9 @@ func extractTarXZ(src, dst string) error {
 	return errors.New("ffmpeg binary not found inside archive")
 }
 
-// extractZip pulls the first file whose basename matches `target` out of a
-// .zip archive and writes it to dst.
-func extractZip(src, dst, target string) error {
+// ExtractZip pulls the first file whose basename matches `target` out of a
+// .zip archive and writes it to dst. Exported for tests.
+func ExtractZip(src, dst, target string) error {
 	r, err := zip.OpenReader(src)
 	if err != nil {
 		return err

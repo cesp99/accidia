@@ -1,7 +1,12 @@
-package main
+// Package audio contains pure-Go decoders for the audio formats we can
+// handle without shelling out to ffmpeg (MP3, FLAC, OGG Vorbis, WAV)
+// plus PCM container utilities used by the media pipeline.
+//
+// Anything not covered by these native decoders is routed through the
+// FFmpeg sidecar (see internal/ffmpeg).
+package audio
 
 import (
-	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -17,41 +22,19 @@ import (
 	"github.com/mewkiz/flac"
 )
 
-// DecodedAudio describes the result of decoding an audio file into PCM.
-//
-// The actual PCM bytes are served over HTTP via the MediaStore — embedding
-// tens of megabytes in this struct would choke the JSON IPC bridge, and
-// WebKit2GTK's `decodeAudioData` is flaky even on perfectly valid WAVs.
-// The frontend fetches `MediaURL`, wraps the bytes in an `Int16Array`, and
-// builds an `AudioBuffer` manually via `createBuffer` + `copyToChannel`,
-// which sidesteps the platform's audio-decoder entirely.
-type DecodedAudio struct {
-	Path       string  `json:"path"`
-	Title      string  `json:"title"`
-	Artist     string  `json:"artist"`
-	Album      string  `json:"album"`
-	Duration   float64 `json:"duration"`
-	SampleRate int     `json:"sampleRate"`
-	Channels   int     `json:"channels"`
-	// Frames is the number of audio frames per channel. `len(pcm) == Frames * Channels`.
-	Frames int `json:"frames"`
-	// MimeType of the body served at MediaURL.
-	MimeType string `json:"mimeType"`
-	// MediaURL points at interleaved little-endian int16 PCM bytes served
-	// by MediaStore. Example: "/media/a1b2c3…". Lifetime is bounded by the
-	// MediaStore LRU — the frontend should fetch promptly.
-	MediaURL string `json:"mediaUrl"`
-}
+// ErrNeedsFFmpeg is returned by DecodeTrack when the native decoders
+// can't handle a format and the caller should fall back to ffmpeg.
+// Kept sentinel-style so callers can detect it with errors.Is.
+var ErrNeedsFFmpeg = errors.New("format requires ffmpeg")
 
-// decodeTrack picks a decoder based on file extension and returns
+// DecodeTrack picks a decoder based on file extension and returns
 // (sampleRate, channels, interleaved-int16-PCM). It is intentionally
 // forgiving: on any decoder error we bubble up a clear message so the
 // frontend can surface it nicely.
 //
 // For formats we don't decode natively in Go (AAC, M4A, Opus, WMA,
-// ALAC, etc.), callers should use Library.DecodeTrack which transparently
-// falls back to the FFmpeg sidecar.
-func decodeTrack(path string) (int, int, []int16, error) {
+// ALAC, etc.), callers should fall back to the FFmpeg sidecar.
+func DecodeTrack(path string) (int, int, []int16, error) {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
 	case ".mp3":
@@ -63,14 +46,9 @@ func decodeTrack(path string) (int, int, []int16, error) {
 	case ".wav", ".wave":
 		return decodeWAV(path)
 	default:
-		return 0, 0, nil, errNeedsFFmpeg
+		return 0, 0, nil, ErrNeedsFFmpeg
 	}
 }
-
-// errNeedsFFmpeg is returned by decodeTrack when the native decoders can't
-// handle a format and the caller should fall back to ffmpeg. It's kept
-// sentinel-style so the library layer can detect it with errors.Is.
-var errNeedsFFmpeg = errors.New("format requires ffmpeg")
 
 // decodeMP3 uses hajimehoshi/go-mp3. Output is always stereo 16-bit PCM at
 // the stream's native sample rate.
@@ -204,17 +182,17 @@ func decodeWAV(path string) (int, int, []int16, error) {
 	if err != nil {
 		return 0, 0, nil, err
 	}
-	return decodeWAVBytes(data)
+	return DecodeWAVBytes(data)
 }
 
-// decodeWAVBytes is the same as decodeWAV but operates on in-memory WAV
+// DecodeWAVBytes is the same as decodeWAV but operates on in-memory WAV
 // bytes. Used when we pipe ffmpeg output through our WAV parser.
 //
 // Handles the common "streaming" quirk where ffmpeg writes 0xFFFFFFFF as
 // the RIFF or `data` chunk size because the real size isn't known up
 // front. When we see that sentinel we treat the chunk as running to the
 // end of the buffer.
-func decodeWAVBytes(data []byte) (int, int, []int16, error) {
+func DecodeWAVBytes(data []byte) (int, int, []int16, error) {
 	if len(data) < 44 || string(data[0:4]) != "RIFF" || string(data[8:12]) != "WAVE" {
 		return 0, 0, nil, errors.New("wav: not a RIFF/WAVE file")
 	}
@@ -363,50 +341,4 @@ func decodeWAVFmt(fmtChunk, dataBuf []byte) (int, int, []int16, error) {
 		}
 	}
 	return 0, 0, nil, fmt.Errorf("wav: extensible %d/%d not supported", format, bits)
-}
-
-// pcmToLittleEndianBytes serialises an int16 slice as interleaved little-
-// endian bytes, the same layout as the "data" chunk in a WAV file. We
-// return a new byte slice so the caller owns the memory.
-func pcmToLittleEndianBytes(samples []int16) []byte {
-	out := make([]byte, len(samples)*2)
-	for i, s := range samples {
-		out[i*2] = byte(uint16(s))
-		out[i*2+1] = byte(uint16(s) >> 8)
-	}
-	return out
-}
-
-// wrapAsWAV takes interleaved 16-bit PCM samples and wraps them in a minimal
-// RIFF/WAVE container. The output is a valid WAV file ready to be decoded
-// by `AudioContext.decodeAudioData` in any webview.
-func wrapAsWAV(sr, ch int, samples []int16) []byte {
-	byteRate := sr * ch * 2
-	blockAlign := ch * 2
-	dataSize := len(samples) * 2
-
-	out := bytes.NewBuffer(make([]byte, 0, dataSize+44))
-	// RIFF header
-	out.WriteString("RIFF")
-	binary.Write(out, binary.LittleEndian, uint32(36+dataSize))
-	out.WriteString("WAVE")
-	// fmt chunk
-	out.WriteString("fmt ")
-	binary.Write(out, binary.LittleEndian, uint32(16))      // PCM chunk size
-	binary.Write(out, binary.LittleEndian, uint16(1))       // PCM format
-	binary.Write(out, binary.LittleEndian, uint16(ch))      //
-	binary.Write(out, binary.LittleEndian, uint32(sr))      //
-	binary.Write(out, binary.LittleEndian, uint32(byteRate))
-	binary.Write(out, binary.LittleEndian, uint16(blockAlign))
-	binary.Write(out, binary.LittleEndian, uint16(16)) // bits per sample
-	// data chunk
-	out.WriteString("data")
-	binary.Write(out, binary.LittleEndian, uint32(dataSize))
-	// Samples are little-endian int16.
-	tmp := make([]byte, 2)
-	for _, s := range samples {
-		binary.LittleEndian.PutUint16(tmp, uint16(s))
-		out.Write(tmp)
-	}
-	return out.Bytes()
 }

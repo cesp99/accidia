@@ -4,6 +4,30 @@
 Wails 2 desktop app. Go backend, Vite + React 19 + Tailwind 4 frontend,
 single binary output.
 
+## Layout
+```
+.
+├── main.go              # Wails entry point (embed + options)
+├── app.go               # Bound struct; glues internal/* together
+├── Makefile             # All build/test/dev commands (see `make help`)
+├── internal/            # Go packages — one per responsibility
+│   ├── audio/           # MP3/FLAC/OGG/WAV decoders + PCM helpers
+│   ├── collection/      # Favorites + playlists persistence
+│   ├── ffmpeg/          # FFmpeg sidecar (locate/download/decode)
+│   ├── health/          # Linux GStreamer health check
+│   ├── library/         # Library scanner + DecodeTrack orchestration
+│   ├── lyrics/          # LRCLIB client + disk cache
+│   ├── media/           # HTTP handler for decoded PCM (asset server)
+│   └── store/           # Settings + library JSON persistence, shared types
+├── tests/               # All *_test.go files (external test packages)
+│   ├── audio/ collection/ ffmpeg/ health/ lyrics/ media/
+└── frontend/            # React + Vite app (unchanged)
+```
+
+Tests are external (`package foo_test`), so they can only exercise the
+exported API of `internal/*`. Helpers that need unexported access should
+be added to a per-package `*_internal_test.go` file.
+
 ## Toolchain
 - Go 1.23+ (`/home/carlo/go/bin` has `wails`, `gopls`, `staticcheck`)
 - Node 20+ / npm
@@ -11,13 +35,13 @@ single binary output.
 - Linux dev needs `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`. Wails on Arch's
   WebKitGTK 4.1 requires the `-tags webkit2_41` build tag.
 - **Linux runtime:** `gst-plugins-good` is mandatory — WebKit2GTK's Web Audio
-  won't work without `autoaudiosink`. `health.go` detects this and the UI
+  won't work without `autoaudiosink`. `internal/health` detects this and the UI
   surfaces a fix hint. On Arch: `sudo pacman -S gst-plugins-good`.
 
 ## Audio pipeline
-- Go decodes MP3/FLAC/OGG/WAV natively (pure-Go decoders). Anything else
-  falls through to the on-demand ffmpeg sidecar (`ffmpeg.go`).
-- Decoded int16 PCM is published to a small LRU media store (`media.go`)
+- Go decodes MP3/FLAC/OGG/WAV natively (`internal/audio`). Anything else
+  falls through to the on-demand ffmpeg sidecar (`internal/ffmpeg`).
+- Decoded int16 PCM is published to a small LRU media store (`internal/media`)
   which implements `http.Handler`. Wails' asset server routes `/media/<token>`
   through it.
 - Frontend fetches the raw PCM bytes, wraps them in `Int16Array`, builds
@@ -26,27 +50,46 @@ single binary output.
   Web Audio decoder is unreliable and this path avoids it entirely.
 
 ## Build commands
-- Frontend only: `cd frontend && npm run build` (TypeScript + Vite)
+All day-to-day commands are in the Makefile:
+- `make` (= `make build`) — production single-binary build
+- `make dev` — hot-reload dev server
+- `make test` — Go unit tests under `tests/`
+- `make test-integration` — integration tests (needs ffmpeg on PATH)
+- `make test-frontend` — TypeScript type-check
+- `make frontend` / `make go-build` / `make bindings` — individual layers
+- `make clean` / `make distclean` — housekeeping
+- `make doctor` — check Go/Node/Wails/ffmpeg are installed
+
+Override anything on the command line, e.g.
+`make BUILD_TAGS=webkit2_41 PLATFORM=linux/arm64 build`.
+
+Underlying commands (in case you need them directly):
+- Frontend only: `cd frontend && npm run build`
 - Go only: `go build -tags webkit2_41 ./...`
-- Full app (production): `/home/carlo/go/bin/wails build -tags webkit2_41`
-- Hot-reload dev: `/home/carlo/go/bin/wails dev -tags webkit2_41`
-- Regenerate TS bindings without building: `/home/carlo/go/bin/wails generate module`
+- Full app: `/home/carlo/go/bin/wails build -tags webkit2_41`
 
 ## Output
-- `build/bin/infinite-jukebox` — single-file Linux binary (~9 MB)
-- macOS: `.app` bundle; Windows: `.exe` (+ NSIS installer with `-nsis`)
+- `build/bin/accidia` — single-file Linux binary (~12 MB)
+- macOS: `.app` bundle; Windows: `.exe` (+ NSIS installer with `make NSIS=1 build`)
 - Cross-platform releases via `.github/workflows/release.yml` (push a `v*` tag)
 
 ## Verifying changes
-1. `cd frontend && npm run build` — catches TS/JSX errors
-2. `go build -tags webkit2_41 ./...` — catches Go errors
-3. `/home/carlo/go/bin/wails build -tags webkit2_41` — full integration
-4. `./build/bin/infinite-jukebox` in a graphical session for runtime check.
+1. `make test-frontend` — catches TS/JSX errors
+2. `make go-build` — catches Go errors
+3. `make build` — full integration (frontend + Go + Wails packaging)
+4. `./build/bin/accidia` in a graphical session for runtime check.
+
+Or, run everything in one shot: `make check`.
 
 ## Architecture rules
-- Heavy work (file I/O, tag parsing, library scan, persistence) lives in Go.
+- Heavy work (file I/O, tag parsing, library scan, persistence) lives in Go,
+  inside `internal/*` subpackages.
+- `main` package contains only the Wails entry point and the bound `App`
+  struct — it imports from `internal/*` and owns no business logic.
 - Audio playback + effects rack stays in the WebView (Web Audio + AudioWorklet).
 - React imports Go bindings from `../wailsjs/go/main/App` (auto-generated).
+  Types appear under their Go package namespaces: `store.Track`, `lyrics.Lyrics`,
+  `collection.Playlist`, `health.Check`, `library.DecodedAudio`, etc.
 - The Wails runtime API (events, log, window control) is at
   `../wailsjs/runtime/runtime` for the frontend.
 - `frontend/wailsjs/` is gitignored and regenerated by every `wails build/dev`.
@@ -54,3 +97,4 @@ single binary output.
 ## Git
 - Commit author: cesp99 / Carlo Esposito.
 - Don't push unless asked.
+

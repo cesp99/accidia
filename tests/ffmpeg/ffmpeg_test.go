@@ -1,4 +1,4 @@
-package main
+package ffmpeg_test
 
 import (
 	"archive/tar"
@@ -10,10 +10,12 @@ import (
 	"testing"
 
 	"github.com/ulikunitz/xz"
+
+	"github.com/cesp99/infinite-jukebox/internal/ffmpeg"
 )
 
 func TestFFmpegDownloadURL(t *testing.T) {
-	url, err := ffmpegDownloadURL()
+	url, err := ffmpeg.DownloadURL()
 	if err != nil {
 		t.Skipf("no URL for %s/%s — that's fine, skip", runtime.GOOS, runtime.GOARCH)
 	}
@@ -25,9 +27,8 @@ func TestFFmpegDownloadURL(t *testing.T) {
 func TestFFmpegService_StatusWhenMissing(t *testing.T) {
 	// Point the cache at an empty tmp dir so we're guaranteed nothing is
 	// found there, even if the host has ffmpeg installed elsewhere.
-	s := NewFFmpegService()
-	s.cacheDir = t.TempDir()
-	status := s.Status()
+	s := ffmpeg.New().WithCacheDir(t.TempDir())
+	status := s.GetStatus()
 	// Status.Available depends on whether system ffmpeg is installed.
 	// We don't assert on that — just make sure the struct is populated.
 	if status.Platform == "" {
@@ -42,13 +43,13 @@ func TestExtractTarXZ_HappyPath(t *testing.T) {
 	archive := filepath.Join(dir, "ffmpeg.tar.xz")
 	payload := []byte("#!/bin/sh\nexit 0\n")
 	if err := buildTarXZ(archive, map[string][]byte{
-		"ffmpeg-build/bin/ffmpeg": payload,
+		"ffmpeg-build/bin/ffmpeg":  payload,
 		"ffmpeg-build/bin/ffprobe": []byte("ffprobe body"),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	out := filepath.Join(dir, "ffmpeg")
-	if err := extractTarXZ(archive, out); err != nil {
+	if err := ffmpeg.ExtractTarXZ(archive, out); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(out)
@@ -70,7 +71,7 @@ func TestExtractZip_HappyPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := filepath.Join(dir, "ffmpeg.exe")
-	if err := extractZip(archive, out, "ffmpeg.exe"); err != nil {
+	if err := ffmpeg.ExtractZip(archive, out, "ffmpeg.exe"); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(out)

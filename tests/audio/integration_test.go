@@ -1,6 +1,6 @@
 //go:build integration
 
-package main
+package audio_test
 
 import (
 	"encoding/binary"
@@ -8,6 +8,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/cesp99/infinite-jukebox/internal/audio"
+	"github.com/cesp99/infinite-jukebox/internal/ffmpeg"
+	"github.com/cesp99/infinite-jukebox/internal/library"
+	"github.com/cesp99/infinite-jukebox/internal/media"
+	"github.com/cesp99/infinite-jukebox/internal/store"
 )
 
 // TestDecodeTrack_RealMP3 runs a real ffmpeg-generated MP3 through the full
@@ -28,22 +34,22 @@ func TestDecodeTrack_RealMP3(t *testing.T) {
 	}
 
 	// Go-side decode: MP3 → WAV → sanity check → re-parse WAV.
-	sr, ch, samples, err := decodeTrack(mp3)
+	sr, ch, samples, err := audio.DecodeTrack(mp3)
 	if err != nil {
-		t.Fatalf("decodeTrack mp3: %v", err)
+		t.Fatalf("DecodeTrack mp3: %v", err)
 	}
 	if sr == 0 || ch == 0 || len(samples) == 0 {
 		t.Fatalf("empty decode: sr=%d ch=%d len=%d", sr, ch, len(samples))
 	}
-	t.Logf("decodeTrack -> sr=%d ch=%d samples=%d duration=%.2fs",
+	t.Logf("DecodeTrack -> sr=%d ch=%d samples=%d duration=%.2fs",
 		sr, ch, len(samples), float64(len(samples)/ch)/float64(sr))
 
-	// wrapAsWAV + re-decode to make sure the wrapped bytes round-trip.
-	wav := wrapAsWAV(sr, ch, samples)
+	// WrapAsWAV + re-decode to make sure the wrapped bytes round-trip.
+	wav := audio.WrapAsWAV(sr, ch, samples)
 	if len(wav) < 44 || string(wav[0:4]) != "RIFF" {
-		t.Fatalf("invalid WAV output: %x", wav[:min(16, len(wav))])
+		t.Fatalf("invalid WAV output: %x", wav[:minInt(16, len(wav))])
 	}
-	ss, cc, pcm, err := decodeWAVBytes(wav)
+	ss, cc, pcm, err := audio.DecodeWAVBytes(wav)
 	if err != nil {
 		t.Fatalf("round-trip decode: %v", err)
 	}
@@ -54,8 +60,8 @@ func TestDecodeTrack_RealMP3(t *testing.T) {
 	// Sanity check: look at a window well past any encoder delay padding
 	// (libmp3lame pads ~1152 silent samples at the start).
 	nonZero := 0
-	start := min(len(pcm), 44100) // at ~1s in
-	end := min(len(pcm), start+4410)
+	start := minInt(len(pcm), 44100) // at ~1s in
+	end := minInt(len(pcm), start+4410)
 	for _, s := range pcm[start:end] {
 		if s != 0 {
 			nonZero++
@@ -67,10 +73,10 @@ func TestDecodeTrack_RealMP3(t *testing.T) {
 	t.Logf("non-zero samples in 100ms window at 1s: %d/%d", nonZero, end-start)
 
 	// Now go through the library-level API that the frontend actually calls.
-	ffmpeg := NewFFmpegService()
-	store := NewStore()
-	media := NewMediaStore(3)
-	lib := NewLibrary(store, ffmpeg, media)
+	ff := ffmpeg.New()
+	st := store.New()
+	md := media.New(3)
+	lib := library.New(st, ff, md)
 	out, err := lib.DecodeTrack(mp3)
 	if err != nil {
 		t.Fatalf("Library.DecodeTrack: %v", err)
@@ -100,7 +106,7 @@ func TestDecodeTrack_RealMP3(t *testing.T) {
 	}
 }
 
-func min(a, b int) int {
+func minInt(a, b int) int {
 	if a < b {
 		return a
 	}

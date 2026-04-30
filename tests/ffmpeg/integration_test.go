@@ -1,6 +1,6 @@
 //go:build integration
 
-package main
+package ffmpeg_test
 
 import (
 	"context"
@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/cesp99/infinite-jukebox/internal/audio"
+	"github.com/cesp99/infinite-jukebox/internal/ffmpeg"
 )
 
 // TestFFmpegService_DecodeM4A is an integration test that relies on a
@@ -25,7 +28,7 @@ func TestFFmpegService_DecodeM4A(t *testing.T) {
 	if _, err := os.Stat(fixture); err != nil {
 		t.Skipf("fixture %s not present — generate it first", fixture)
 	}
-	svc := NewFFmpegService()
+	svc := ffmpeg.New()
 	if _, err := svc.Locate(); err != nil {
 		t.Skipf("ffmpeg not on PATH: %v", err)
 	}
@@ -37,9 +40,9 @@ func TestFFmpegService_DecodeM4A(t *testing.T) {
 	if len(wav) < 44 || string(wav[0:4]) != "RIFF" || string(wav[8:12]) != "WAVE" {
 		t.Fatal("expected a RIFF/WAVE payload from ffmpeg")
 	}
-	sr, ch, pcm, err := decodeWAVBytes(wav)
+	sr, ch, pcm, err := audio.DecodeWAVBytes(wav)
 	if err != nil {
-		t.Fatalf("decodeWAVBytes: %v", err)
+		t.Fatalf("DecodeWAVBytes: %v", err)
 	}
 	if sr == 0 || ch == 0 || len(pcm) == 0 {
 		t.Fatalf("empty decode: sr=%d ch=%d pcm=%d", sr, ch, len(pcm))

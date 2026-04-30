@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Mic2, Loader2, HeartCrack } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { FetchLyrics } from "../../../wailsjs/go/main/App";
-import type { main } from "../../../wailsjs/go/models";
+import type { lyrics } from "../../../wailsjs/go/models";
 
 interface LyricsViewProps {
   title?: string;
@@ -18,7 +18,7 @@ interface LyricsViewProps {
 
 interface FetchState {
   loading: boolean;
-  lyrics: main.Lyrics | null;
+  lyrics: lyrics.Lyrics | null;
   error: string | null;
 }
 
