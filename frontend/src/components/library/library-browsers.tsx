@@ -28,35 +28,93 @@ export interface ArtistGroup {
   artworkSource?: string;
 }
 
+// Separators commonly found inside multi-artist tags. We match on a
+// single occurrence so "Daft Punk, Julian Casablancas" yields "Daft Punk"
+// as the primary artist. The " & " / " x " / " with " variants require
+// surrounding whitespace to avoid chewing into legitimate names like
+// "B&B" or "Sixx:A.M.".
+const ARTIST_SPLIT_RE = /\s*(?:,|;|\/| & | feat\. | featuring | ft\. | x | with )\s*/i;
+
+/** First artist token in a potentially multi-artist string. */
+export function primaryArtist(name: string): string {
+  const trimmed = (name || "").trim();
+  if (!trimmed) return "";
+  const idx = trimmed.search(ARTIST_SPLIT_RE);
+  return idx < 0 ? trimmed : trimmed.slice(0, idx).trim();
+}
+
 /**
- * Group consecutive tracks by (albumArtist|artist, album). Produces stable
- * album buckets for the Albums grid and the drill-down views. The input
- * is expected to already be sorted by artist/album (as Library.Scan does)
- * so consecutive grouping is sufficient and memory-cheap.
+ * Album identity used for grouping. Two tracks with the same (trimmed,
+ * case-insensitive) album title belong to the same album regardless of
+ * which featuring artists happen to be credited on each track — matching
+ * how users think about albums like "Random Access Memories" (Daft Punk)
+ * whose guest-heavy tracklist would otherwise fan out into many cards.
+ *
+ * Tracks without an album tag fall back to a per-artist "Unknown Album"
+ * bucket so we don't collapse unrelated loose files into a single blob.
+ */
+function albumIdentityKey(t: Track): string {
+  const album = (t.album || "").trim();
+  if (album) return `album:${album.toLowerCase()}`;
+  const artist = (t.albumArtist || t.artist || "Unknown Artist").trim();
+  return `unknown:${artist.toLowerCase()}`;
+}
+
+/**
+ * Group tracks into albums by album title (case-insensitive). The display
+ * artist is resolved to the primary artist shared by most tracks — for
+ * an album full of "Daft Punk, $guest" credits that collapses to plain
+ * "Daft Punk". Genuine compilations where every track has a distinct
+ * primary artist render as "Various Artists".
  */
 export function groupByAlbum(tracks: Track[]): AlbumGroup[] {
-  const groups: AlbumGroup[] = [];
-  let current: AlbumGroup | null = null;
+  const byKey = new Map<string, AlbumGroup>();
+  // Per-group tally of primary-artist → count, used to pick a stable
+  // display artist for the whole album instead of whichever track we
+  // happened to visit first.
+  const primaryCounts = new Map<string, Map<string, number>>();
+
   for (const t of tracks) {
-    const albumKey = (t.album || "Unknown Album").trim();
-    const artistKey = (t.albumArtist || t.artist || "Unknown Artist").trim();
-    const key = `${artistKey}::${albumKey}`;
-    if (!current || current.key !== key) {
-      current = {
+    const key = albumIdentityKey(t);
+    let g = byKey.get(key);
+    if (!g) {
+      g = {
         key,
-        album: albumKey,
-        artist: artistKey,
+        album: (t.album || "Unknown Album").trim(),
+        artist: "",
         tracks: [],
         artworkSource: t.hasCoverArt ? t.path : undefined,
       };
-      groups.push(current);
+      byKey.set(key, g);
+      primaryCounts.set(key, new Map());
     }
-    if (!current.artworkSource && t.hasCoverArt) {
-      current.artworkSource = t.path;
-    }
-    current.tracks.push(t);
+    if (!g.artworkSource && t.hasCoverArt) g.artworkSource = t.path;
+    g.tracks.push(t);
+    const primary = primaryArtist(t.albumArtist || t.artist || "") || "Unknown Artist";
+    const counts = primaryCounts.get(key)!;
+    counts.set(primary, (counts.get(primary) || 0) + 1);
   }
-  return groups;
+
+  for (const [key, g] of byKey) {
+    const counts = primaryCounts.get(key)!;
+    let best = "Unknown Artist";
+    let bestCount = 0;
+    for (const [name, c] of counts) {
+      if (c > bestCount) {
+        best = name;
+        bestCount = c;
+      }
+    }
+    // If every track has a unique primary artist (and there's more than
+    // one track), this is a compilation — label it accordingly.
+    g.artist = counts.size === g.tracks.length && g.tracks.length > 1
+      ? "Various Artists"
+      : best;
+  }
+
+  return Array.from(byKey.values()).sort(
+    (a, b) => a.artist.localeCompare(b.artist) || a.album.localeCompare(b.album),
+  );
 }
 
 /**

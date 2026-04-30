@@ -4,6 +4,7 @@ import { cn } from "@/lib/utils";
 import type { store } from "../../../wailsjs/go/models";
 import { GetCoverArt } from "../../../wailsjs/go/main/App";
 import { TrackContextMenu } from "./track-context-menu";
+import { groupByAlbum, type AlbumGroup } from "./library-browsers";
 import type { Playlist } from "@/hooks/use-playlists";
 
 type Track = store.Track;
@@ -57,46 +58,6 @@ interface TrackListProps {
   hideSearch?: boolean;
   /** Extra content to render alongside the heading (e.g. "Play all" button). */
   headerActions?: React.ReactNode;
-}
-
-interface AlbumGroup {
-  key: string;
-  album: string;
-  artist: string;
-  artwork?: string | null;
-  tracks: Track[];
-  // Path of any track in the album with cover art — used to fetch artwork.
-  artworkSource?: string;
-}
-
-/**
- * Group consecutive tracks by (albumArtist|artist, album). Produces nice
- * album cards instead of a flat 4000-row list which is jarring even when
- * virtualized.
- */
-function groupByAlbum(tracks: Track[]): AlbumGroup[] {
-  const groups: AlbumGroup[] = [];
-  let current: AlbumGroup | null = null;
-  for (const t of tracks) {
-    const albumKey = (t.album || "Unknown Album").trim();
-    const artistKey = (t.albumArtist || t.artist || "Unknown Artist").trim();
-    const groupKey = `${artistKey}::${albumKey}`;
-    if (!current || current.key !== groupKey) {
-      current = {
-        key: groupKey,
-        album: albumKey,
-        artist: artistKey,
-        tracks: [],
-        artworkSource: t.hasCoverArt ? t.path : undefined,
-      };
-      groups.push(current);
-    }
-    if (!current.artworkSource && t.hasCoverArt) {
-      current.artworkSource = t.path;
-    }
-    current.tracks.push(t);
-  }
-  return groups;
 }
 
 export function TrackList({
